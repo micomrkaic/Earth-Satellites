@@ -2,15 +2,16 @@
 // Build:  gcc -O2 -std=c17 -o earth_orbit earth_orbit.c $(sdl2-config --cflags --libs) -lm
 //
 // Controls:
-//   Left-drag    rotate view
-//   Scroll       zoom in/out
+//   Left-drag    rotate view (3D mode)
+//   Scroll       zoom in/out (3D mode)
 //   +/=          faster
 //   -            slower
 //   1-8          toggle satellite
 //   R            reset view
 //   Space        pause / resume
 //   J            toggle J2 oblateness perturbation
-//   G            toggle ground track display
+//   G            toggle ground track display (3D mode)
+//   P            toggle Mercator map / 3D sphere view
 //   V            start/stop MP4 video capture  (requires ffmpeg in PATH)
 //   Q / Esc      quit
 
@@ -27,28 +28,35 @@
    ====================================================================== */
 #define WIN_W    1200
 #define WIN_H     780
-#define CX        480          /* earth disc centre X (pixels) */
-#define CY        390          /* earth disc centre Y (pixels) */
-#define BASE_R    270.0        /* earth radius at zoom = 1.0 (pixels) */
-#define ZOOM_INIT   0.15       /* initial zoom — shows all orbits incl. GEO/Tundra */
+#define CX        480
+#define CY        390
+#define BASE_R    270.0
+#define ZOOM_INIT   0.15
 #define ZOOM_MIN    0.04
 #define ZOOM_MAX    8.0
 
-#define RE        6371000.0       /* Earth radius (m) */
-#define GM        3.986004418e14  /* gravitational parameter (m^3/s^2) */
-#define OMEGA_E   7.2921150e-5    /* Earth rotation rate (rad/s) */
-#define J2_COEFF  1.08263e-3      /* Earth J2 zonal harmonic */
+#define RE        6371000.0
+#define GM        3.986004418e14
+#define OMEGA_E   7.2921150e-5
+#define J2_COEFF  1.08263e-3
 #define PI        3.14159265358979323846
 #define DEG       (PI/180.0)
 
-#define DT_PHYS   20.0         /* Verlet physics timestep (s) */
+#define DT_PHYS   20.0
 #define NUM_SATS   8
 #define TRAIL_LEN  500
 #define TRAIL_STEP   5
 #define ORBIT_PTS  360
 
+/* Ground track history — 1500 samples × 100 s/sample ≈ 41.7 h.
+   Enough for ≥1 full orbit of every satellite type. */
+#define GT_LEN   1500
+
+/* Mercator map clipped to ±82° latitude */
+#define MAP_LAT_CLIP (82.0 * DEG)
+
 /* ======================================================================
-   5x7 bitmap font
+   5×7 bitmap font
    ====================================================================== */
 static const uint8_t FONT[59][7] = {
 /* 32 ' ' */{0x00,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -138,47 +146,45 @@ static void draw_str(SDL_Renderer *ren, int x, int y, const char *s,
    ====================================================================== */
 typedef struct { double x, y, z; } V3;
 
-static inline V3     v3add(V3 a, V3 b)    { return (V3){a.x+b.x, a.y+b.y, a.z+b.z}; }
-static inline V3     v3scl(V3 a, double s){ return (V3){a.x*s, a.y*s, a.z*s}; }
-static inline double v3dot(V3 a, V3 b)    { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline V3     v3add(V3 a, V3 b)    { return (V3){a.x+b.x,a.y+b.y,a.z+b.z}; }
+static inline V3     v3scl(V3 a, double s){ return (V3){a.x*s,a.y*s,a.z*s}; }
+static inline double v3dot(V3 a, V3 b)    { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static inline double v3len(V3 a)           { return sqrt(v3dot(a,a)); }
-static inline V3     v3norm(V3 a)         { double l = v3len(a); return v3scl(a,1.0/l); }
+static inline V3     v3norm(V3 a)         { double l=v3len(a); return v3scl(a,1.0/l); }
 
 static V3 rx(V3 v, double a) {
-    double c = cos(a), s = sin(a);
-    return (V3){v.x, c*v.y - s*v.z, s*v.y + c*v.z};
+    double c=cos(a),s=sin(a);
+    return (V3){v.x, c*v.y-s*v.z, s*v.y+c*v.z};
 }
 static V3 ry(V3 v, double a) __attribute__((unused));
 static V3 ry(V3 v, double a) {
-    double c = cos(a), s = sin(a);
-    return (V3){c*v.x + s*v.z, v.y, -s*v.x + c*v.z};
+    double c=cos(a),s=sin(a);
+    return (V3){c*v.x+s*v.z, v.y, -s*v.x+c*v.z};
 }
 static V3 rz(V3 v, double a) {
-    double c = cos(a), s = sin(a);
-    return (V3){c*v.x - s*v.y, s*v.x + c*v.y, v.z};
+    double c=cos(a),s=sin(a);
+    return (V3){c*v.x-s*v.y, s*v.x+c*v.y, v.z};
 }
 
-/* P_view = Rx(-pitch) * Rz(-yaw) * P_eci */
 static V3 eci_to_view(V3 p, double yaw, double pitch) {
-    return rx(rz(p, -yaw), -pitch);
+    return rx(rz(p,-yaw),-pitch);
 }
 static V3 view_to_eci(V3 p, double yaw, double pitch) {
-    return rz(rx(p, pitch), yaw);
+    return rz(rx(p,pitch),yaw);
 }
 
-static int px_x(V3 v, double Rpx) { return (int)(CX + Rpx * v.x / RE); }
-static int px_y(V3 v, double Rpx) { return (int)(CY - Rpx * v.y / RE); }
+static int px_x(V3 v, double Rpx) { return (int)(CX + Rpx*v.x/RE); }
+static int px_y(V3 v, double Rpx) { return (int)(CY - Rpx*v.y/RE); }
 
 static int occluded(V3 v, double Rpx) {
     (void)Rpx;
-    double nx = v.x/RE, ny = v.y/RE;
-    double r2 = nx*nx + ny*ny;
-    if (r2 >= 1.0) return 0;
-    return v.z < sqrt(1.0 - r2) * RE;
+    double nx=v.x/RE, ny=v.y/RE, r2=nx*nx+ny*ny;
+    if (r2>=1.0) return 0;
+    return v.z < sqrt(1.0-r2)*RE;
 }
 
 /* ======================================================================
-   Continent polygons  (lon, lat)
+   Continent polygons  (lon, lat in degrees)
    ====================================================================== */
 #define POLY(name) static const double name[][2] =
 
@@ -249,26 +255,24 @@ POLY(UK) {
 #define UK_N 10
 
 /* ======================================================================
-   Land mask (720x360, 0.5 deg/cell)
+   Land mask (720×360, 0.5°/cell)
    ====================================================================== */
 #define LM_LAT 360
 #define LM_LON 720
 static uint8_t land_mask[LM_LAT][LM_LON];
 
 static int pip(double lon, double lat, const double poly[][2], int n) {
-    int inside = 0;
-    for (int i = 0, j = n-1; i < n; j = i++) {
-        double xi = poly[i][0], yi = poly[i][1];
-        double xj = poly[j][0], yj = poly[j][1];
-        if (((yi > lat) != (yj > lat)) &&
-            lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)
-            inside = !inside;
+    int inside=0;
+    for (int i=0,j=n-1; i<n; j=i++) {
+        double xi=poly[i][0],yi=poly[i][1],xj=poly[j][0],yj=poly[j][1];
+        if (((yi>lat)!=(yj>lat)) && lon<(xj-xi)*(lat-yi)/(yj-yi)+xi)
+            inside=!inside;
     }
     return inside;
 }
 
 static int point_on_land(double lon, double lat) {
-    if (lat < -65.0) return 1;
+    if (lat<-65.0) return 1;
     if (pip(lon,lat,NA,NA_N)) return 1;
     if (pip(lon,lat,SA,SA_N)) return 1;
     if (pip(lon,lat,EU,EU_N)) return 1;
@@ -281,24 +285,22 @@ static int point_on_land(double lon, double lat) {
 }
 
 static void build_land_mask(void) {
-    for (int la = 0; la < LM_LAT; la++) {
-        double lat = (la + 0.5) * 0.5 - 90.0;
-        for (int lo = 0; lo < LM_LON; lo++) {
-            double lon = (lo + 0.5) * 0.5 - 180.0;
-            land_mask[la][lo] = (uint8_t)point_on_land(lon, lat);
+    for (int la=0; la<LM_LAT; la++) {
+        double lat=(la+0.5)*0.5-90.0;
+        for (int lo=0; lo<LM_LON; lo++) {
+            double lon=(lo+0.5)*0.5-180.0;
+            land_mask[la][lo]=(uint8_t)point_on_land(lon,lat);
         }
     }
 }
 
 static uint8_t lm_lookup(double lat_rad, double lon_rad) {
-    double lat = lat_rad * (180.0/PI);
-    double lon = lon_rad * (180.0/PI);
-    int la = (int)((lat + 90.0) * 2.0);
-    int lo = (int)((lon + 180.0) * 2.0);
-    if (la <       0) la = 0;
-    if (la >= LM_LAT) la = LM_LAT-1;
-    if (lo <       0) lo = 0;
-    if (lo >= LM_LON) lo = LM_LON-1;
+    double lat=lat_rad*(180.0/PI), lon=lon_rad*(180.0/PI);
+    int la=(int)((lat+90.0)*2.0), lo=(int)((lon+180.0)*2.0);
+    if (la<0)       la=0;
+    if (la>=LM_LAT) la=LM_LAT-1;
+    if (lo<0)       lo=0;
+    if (lo>=LM_LON) lo=LM_LON-1;
     return land_mask[la][lo];
 }
 
@@ -312,97 +314,101 @@ typedef struct {
 } OrbEl;
 
 static double kepler(double M, double e) {
-    double E = M;
-    for (int i = 0; i < 60; i++) {
-        double dE = (M - E + e*sin(E)) / (1.0 - e*cos(E));
-        E += dE;
-        if (fabs(dE) < 1e-13) break;
+    double E=M;
+    for (int i=0; i<60; i++) {
+        double dE=(M-E+e*sin(E))/(1.0-e*cos(E));
+        E+=dE;
+        if (fabs(dE)<1e-13) break;
     }
     return E;
 }
 
 static V3 orbit_pos_eci(const OrbEl *el, double nu) {
-    double cO = cos(el->Omega), sO = sin(el->Omega);
-    double co = cos(el->omega), so = sin(el->omega);
-    double ci = cos(el->inc),   si = sin(el->inc);
-    double Px =  cO*co - sO*so*ci,  Py = sO*co + cO*so*ci,  Pz = so*si;
-    double Qx = -cO*so - sO*co*ci,  Qy =-sO*so + cO*co*ci,  Qz = co*si;
-    double p   = el->a * (1.0 - el->e*el->e);
-    double r   = p / (1.0 + el->e*cos(nu));
-    double xo  = r*cos(nu), yo = r*sin(nu);
+    double cO=cos(el->Omega),sO=sin(el->Omega);
+    double co=cos(el->omega),so=sin(el->omega);
+    double ci=cos(el->inc), si=sin(el->inc);
+    double Px= cO*co-sO*so*ci, Py=sO*co+cO*so*ci, Pz=so*si;
+    double Qx=-cO*so-sO*co*ci, Qy=-sO*so+cO*co*ci, Qz=co*si;
+    double p=el->a*(1.0-el->e*el->e);
+    double r=p/(1.0+el->e*cos(nu));
+    double xo=r*cos(nu),yo=r*sin(nu);
     return (V3){Px*xo+Qx*yo, Py*xo+Qy*yo, Pz*xo+Qz*yo};
 }
 
 static void el_to_state(const OrbEl *el, V3 *pos, V3 *vel) {
-    double E  = kepler(el->M0, el->e);
-    double nu = 2.0*atan2(sqrt(1.0+el->e)*sin(E/2.0),
-                           sqrt(1.0-el->e)*cos(E/2.0));
-    double cO = cos(el->Omega), sO = sin(el->Omega);
-    double co = cos(el->omega), so = sin(el->omega);
-    double ci = cos(el->inc),   si = sin(el->inc);
-    double Px =  cO*co - sO*so*ci,  Py = sO*co + cO*so*ci,  Pz = so*si;
-    double Qx = -cO*so - sO*co*ci,  Qy =-sO*so + cO*co*ci,  Qz = co*si;
-    double p   = el->a * (1.0 - el->e*el->e);
-    double r   = p / (1.0 + el->e*cos(nu));
-    double xo  = r*cos(nu), yo = r*sin(nu);
-    *pos = (V3){Px*xo+Qx*yo, Py*xo+Qy*yo, Pz*xo+Qz*yo};
-    double h   = sqrt(GM * p);
-    double vr  = (GM/h) * el->e * sin(nu);
-    double vt  = (GM/h) * (1.0 + el->e*cos(nu));
-    double vxo = vr*cos(nu) - vt*sin(nu);
-    double vyo = vr*sin(nu) + vt*cos(nu);
-    *vel = (V3){Px*vxo+Qx*vyo, Py*vxo+Qy*vyo, Pz*vxo+Qz*vyo};
+    double E=kepler(el->M0,el->e);
+    double nu=2.0*atan2(sqrt(1.0+el->e)*sin(E/2.0),sqrt(1.0-el->e)*cos(E/2.0));
+    double cO=cos(el->Omega),sO=sin(el->Omega);
+    double co=cos(el->omega),so=sin(el->omega);
+    double ci=cos(el->inc), si=sin(el->inc);
+    double Px= cO*co-sO*so*ci, Py=sO*co+cO*so*ci, Pz=so*si;
+    double Qx=-cO*so-sO*co*ci, Qy=-sO*so+cO*co*ci, Qz=co*si;
+    double p=el->a*(1.0-el->e*el->e), r=p/(1.0+el->e*cos(nu));
+    double xo=r*cos(nu),yo=r*sin(nu);
+    *pos=(V3){Px*xo+Qx*yo, Py*xo+Qy*yo, Pz*xo+Qz*yo};
+    double h=sqrt(GM*p);
+    double vr=(GM/h)*el->e*sin(nu), vt=(GM/h)*(1.0+el->e*cos(nu));
+    double vxo=vr*cos(nu)-vt*sin(nu), vyo=vr*sin(nu)+vt*cos(nu);
+    *vel=(V3){Px*vxo+Qx*vyo, Py*vxo+Qy*vyo, Pz*vxo+Qz*vyo};
 }
 
 /* ======================================================================
-   Satellite state + Velocity Verlet with optional J2
+   Satellite state
    ====================================================================== */
 typedef struct {
     V3  pos, vel;
     const OrbEl *el;
+    /* 3D trail (ECI positions) */
     V3  trail[TRAIL_LEN];
     int trail_head, trail_cnt, trail_ctr;
-    int visible;
+    /* 2D ground track (Earth-fixed lat/lon in radians) */
+    float gt_lat[GT_LEN];
+    float gt_lon[GT_LEN];
+    int   gt_head, gt_cnt;
+    int   visible;
 } Sat;
 
 static void sat_init(Sat *s, const OrbEl *el) {
-    s->el         = el;
-    el_to_state(el, &s->pos, &s->vel);
-    s->trail_head = 0;
-    s->trail_cnt  = 0;
-    s->trail_ctr  = 0;
-    s->visible    = 1;
+    s->el=el;
+    el_to_state(el,&s->pos,&s->vel);
+    s->trail_head=0; s->trail_cnt=0; s->trail_ctr=0;
+    s->gt_head=0;    s->gt_cnt=0;
+    s->visible=1;
 }
 
-/* Gravitational acceleration with optional J2 zonal harmonic */
 static V3 gravity(V3 pos, int use_j2) {
-    double r2 = v3dot(pos, pos);
-    double r  = sqrt(r2);
-    V3 a      = v3scl(pos, -GM / (r2 * r));
+    double r2=v3dot(pos,pos), r=sqrt(r2);
+    V3 a=v3scl(pos,-GM/(r2*r));
     if (use_j2) {
-        double z2r2 = (pos.z * pos.z) / r2;
-        double fac  = 1.5 * J2_COEFF * GM * RE*RE / (r2 * r2 * r);
-        a.x += fac * pos.x * (1.0 - 5.0*z2r2);
-        a.y += fac * pos.y * (1.0 - 5.0*z2r2);
-        a.z += fac * pos.z * (3.0 - 5.0*z2r2);
+        double z2r2=(pos.z*pos.z)/r2;
+        double fac=1.5*J2_COEFF*GM*RE*RE/(r2*r2*r);
+        a.x+=fac*pos.x*(1.0-5.0*z2r2);
+        a.y+=fac*pos.y*(1.0-5.0*z2r2);
+        a.z+=fac*pos.z*(3.0-5.0*z2r2);
     }
     return a;
 }
 
-static void sat_step(Sat *s, double dt, int use_j2) {
+static void sat_step(Sat *s, double dt, int use_j2, double earth_angle) {
     /* Velocity Verlet */
-    V3 a0  = gravity(s->pos, use_j2);
-    s->vel = v3add(s->vel, v3scl(a0, 0.5*dt));
-    s->pos = v3add(s->pos, v3scl(s->vel, dt));
-    V3 a1  = gravity(s->pos, use_j2);
-    s->vel = v3add(s->vel, v3scl(a1, 0.5*dt));
+    V3 a0=gravity(s->pos,use_j2);
+    s->vel=v3add(s->vel,v3scl(a0,0.5*dt));
+    s->pos=v3add(s->pos,v3scl(s->vel,dt));
+    V3 a1=gravity(s->pos,use_j2);
+    s->vel=v3add(s->vel,v3scl(a1,0.5*dt));
 
-    /* Trail sample */
     if (++s->trail_ctr >= TRAIL_STEP) {
-        s->trail_ctr = 0;
-        s->trail[s->trail_head] = s->pos;
-        s->trail_head = (s->trail_head + 1) % TRAIL_LEN;
-        if (s->trail_cnt < TRAIL_LEN) s->trail_cnt++;
+        s->trail_ctr=0;
+        /* 3D trail */
+        s->trail[s->trail_head]=s->pos;
+        s->trail_head=(s->trail_head+1)%TRAIL_LEN;
+        if (s->trail_cnt<TRAIL_LEN) s->trail_cnt++;
+        /* 2D ground track: rotate ECI → Earth-fixed */
+        V3 ef=rz(v3norm(s->pos),-earth_angle);
+        s->gt_lat[s->gt_head]=(float)asin(fmax(-1.0,fmin(1.0,ef.z)));
+        s->gt_lon[s->gt_head]=(float)atan2(ef.y,ef.x);
+        s->gt_head=(s->gt_head+1)%GT_LEN;
+        if (s->gt_cnt<GT_LEN) s->gt_cnt++;
     }
 }
 
@@ -415,16 +421,15 @@ static uint8_t star_b[N_STARS];
 
 static void build_stars(void) {
     srand(42);
-    for (int i = 0; i < N_STARS; i++) {
-        int x, y;
+    for (int i=0; i<N_STARS; i++) {
+        int x,y;
         do {
-            x = rand() % WIN_W;
-            y = rand() % WIN_H;
-            double dx = x-CX, dy = y-CY;
-            if (dx*dx + dy*dy > (BASE_R+30)*(BASE_R+30)) break;
-        } while (1);
-        star_x[i] = x;  star_y[i] = y;
-        star_b[i]  = (uint8_t)(80 + rand() % 176);
+            x=rand()%WIN_W; y=rand()%WIN_H;
+            double dx=x-CX,dy=y-CY;
+            if (dx*dx+dy*dy>(BASE_R+30)*(BASE_R+30)) break;
+        } while(1);
+        star_x[i]=x; star_y[i]=y;
+        star_b[i]=(uint8_t)(80+rand()%176);
     }
 }
 
@@ -432,206 +437,480 @@ static void build_stars(void) {
    Orbit definitions
    ====================================================================== */
 static const OrbEl ORBITS[NUM_SATS] = {
-    { 42164000.0, 0.000,  0.0*DEG,   0.0*DEG,   0.0*DEG,   0.0*DEG, "GEO",     0,  255, 255 },
-    { 42164000.0, 0.000, 28.0*DEG,  45.0*DEG,   0.0*DEG, 120.0*DEG, "GEOSYNC", 255, 255, 255 },
-    { 26560000.0, 0.740, 63.4*DEG,   0.0*DEG, 270.0*DEG, 180.0*DEG, "MOLNIYA", 255,  50,  50 },
-    {  6778000.0, 0.000, 51.6*DEG,  45.0*DEG,   0.0*DEG,  90.0*DEG, "ISS",     255, 255,   0 },
-    {  7000000.0, 0.000, 90.0*DEG,  90.0*DEG,   0.0*DEG,   0.0*DEG, "POLAR",    50, 255,  50 },
-    { 26560000.0, 0.010, 55.0*DEG, 160.0*DEG,   0.0*DEG, 240.0*DEG, "MEO/GPS", 255,  50, 255 },
-    { 42164000.0, 0.270, 63.4*DEG,   0.0*DEG, 270.0*DEG, 270.0*DEG, "TUNDRA",  255, 165,   0 },
-    {  7178000.0, 0.000, 98.7*DEG, 130.0*DEG,   0.0*DEG, 180.0*DEG, "SSO",     255, 150, 200 },
+    { 42164000.0,0.000, 0.0*DEG,  0.0*DEG,  0.0*DEG,  0.0*DEG,"GEO",     0,  255,255},
+    { 42164000.0,0.000,28.0*DEG, 45.0*DEG,  0.0*DEG,120.0*DEG,"GEOSYNC",255,255,255},
+    { 26560000.0,0.740,63.4*DEG,  0.0*DEG,270.0*DEG,180.0*DEG,"MOLNIYA",255, 50, 50},
+    {  6778000.0,0.000,51.6*DEG, 45.0*DEG,  0.0*DEG, 90.0*DEG,"ISS",    255,255,  0},
+    {  7000000.0,0.000,90.0*DEG, 90.0*DEG,  0.0*DEG,  0.0*DEG,"POLAR",   50,255, 50},
+    { 26560000.0,0.010,55.0*DEG,160.0*DEG,  0.0*DEG,240.0*DEG,"MEO/GPS",255, 50,255},
+    { 42164000.0,0.270,63.4*DEG,  0.0*DEG,270.0*DEG,270.0*DEG,"TUNDRA", 255,165,  0},
+    {  7178000.0,0.000,98.7*DEG,130.0*DEG,  0.0*DEG,180.0*DEG,"SSO",    255,150,200},
 };
 
 /* ======================================================================
-   Earth sphere rendering (per-pixel raycast into streaming texture)
+   Mercator map background texture
+   ====================================================================== */
+static double g_map_y_max;   /* = log(tan(PI/4 + MAP_LAT_CLIP/2)) */
+
+/* Map-space projections */
+static int map_lon_to_px(double lon) {
+    return (int)((lon + PI) / (2.0*PI) * WIN_W);
+}
+static int map_lat_to_py(double lat) {
+    if (lat >  MAP_LAT_CLIP) lat =  MAP_LAT_CLIP;
+    if (lat < -MAP_LAT_CLIP) lat = -MAP_LAT_CLIP;
+    double y = log(tan(PI/4.0 + lat/2.0));
+    return (int)((g_map_y_max - y) / (2.0*g_map_y_max) * WIN_H);
+}
+
+/* Large pixel buffer lives in BSS — 3.7 MB */
+static uint32_t map_tex_buf[WIN_H * WIN_W];
+
+static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
+    /* Colour palette — NASA MCC dark theme */
+    const uint32_t C_OCEAN    = 0xFF06101E;   /* deep navy */
+    const uint32_t C_OCEAN_SH = 0xFF0A1828;   /* slightly lighter near coast */
+    const uint32_t C_LAND     = 0xFF142B10;   /* dark forest green */
+    const uint32_t C_COAST    = 0xFF3A7832;   /* bright coastline */
+    const uint32_t C_ICE      = 0xFFB8C8D8;   /* polar ice */
+    const uint32_t C_GRID     = 0xFF111E30;   /* dim grid */
+    const uint32_t C_GRID_EQ  = 0xFF1A3050;   /* equator / prime meridian */
+
+    for (int py=0; py<WIN_H; py++) {
+        /* Inverse Mercator for this row (and row+1 for neighbour check) */
+        double ym   = g_map_y_max*(1.0 - 2.0*py/(double)WIN_H);
+        double lat  = 2.0*atan(exp(ym)) - PI/2.0;
+        double ym1  = g_map_y_max*(1.0 - 2.0*(py+1)/(double)WIN_H);
+        double latn = (py+1<WIN_H) ? 2.0*atan(exp(ym1))-PI/2.0 : lat;
+
+        double lat_deg = lat*(180.0/PI);
+
+        for (int px=0; px<WIN_W; px++) {
+            double lon  = ((double)px /(double)WIN_W)*2.0*PI - PI;
+            double lone = ((double)(px+1)/(double)WIN_W)*2.0*PI - PI;
+
+            int land     = lm_lookup(lat,  lon);
+            int land_e   = lm_lookup(lat,  lone);
+            int land_s   = lm_lookup(latn, lon);
+            int is_coast = land && (!land_e || !land_s);
+            int is_shore = !land && (land_e || land_s);  /* ocean next to land */
+
+            /* Latitude / longitude grid lines */
+            double la30 = fmod(fabs(lat_deg), 30.0);
+            double lo_d = lon*(180.0/PI);
+            double lo_d_pos = lo_d < 0 ? lo_d+360.0 : lo_d;
+            double lo30 = fmod(lo_d_pos, 30.0);
+            int on_eq   = fabs(lat_deg) < 0.25;
+            int on_pm   = fabs(lo_d) < 0.18;
+            int on_grid = (la30 < 0.45) || (lo30 < 0.22);
+
+            uint32_t col;
+            if (is_coast) {
+                col = C_COAST;
+            } else if (land) {
+                /* Polar ice: Antarctica and Arctic edges */
+                double al = fabs(lat_deg);
+                if (al > 75.0) {
+                    double f = fmin(1.0, (al-75.0)/7.0);
+                    /* blend land → ice */
+                    uint8_t lr = (C_LAND>>16)&0xFF, lg=(C_LAND>>8)&0xFF, lb=C_LAND&0xFF;
+                    uint8_t ir = (C_ICE>>16)&0xFF,  ig=(C_ICE>>8)&0xFF,  ib=C_ICE&0xFF;
+                    uint8_t R=(uint8_t)(lr+f*(ir-lr)), G=(uint8_t)(lg+f*(ig-lg)), B=(uint8_t)(lb+f*(ib-lb));
+                    col = 0xFF000000|((uint32_t)R<<16)|((uint32_t)G<<8)|B;
+                } else {
+                    col = C_LAND;
+                }
+            } else {
+                /* Ocean */
+                if (is_shore) col = C_OCEAN_SH;
+                else          col = C_OCEAN;
+            }
+
+            /* Grid overlay (only on ocean / non-coast) */
+            if (!is_coast && !land) {
+                if (on_eq || on_pm)  col = C_GRID_EQ;
+                else if (on_grid)    col = C_GRID;
+            } else if (land && !is_coast) {
+                /* Subtle grid on land too */
+                if (on_grid) {
+                    uint8_t R=(col>>16)&0xFF, G=(col>>8)&0xFF, B=col&0xFF;
+                    R=(uint8_t)(R*0.78); G=(uint8_t)(G*0.78); B=(uint8_t)(B*0.78);
+                    col = 0xFF000000|((uint32_t)R<<16)|((uint32_t)G<<8)|B;
+                }
+            }
+
+            map_tex_buf[py*WIN_W + px] = col;
+        }
+    }
+
+    SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                          SDL_TEXTUREACCESS_STATIC, WIN_W, WIN_H);
+    if (!tex) return NULL;
+    SDL_UpdateTexture(tex, NULL, map_tex_buf, WIN_W*4);
+    return tex;
+}
+
+/* ======================================================================
+   Mercator map view renderer
+   ====================================================================== */
+static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
+                             const Sat sats[NUM_SATS],
+                             double earth_angle,
+                             double sim_time, int paused,
+                             int use_j2, int recording,
+                             uint32_t frame_count)
+{
+    /* Background map */
+    SDL_RenderCopy(ren, map_tex, NULL, NULL);
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+
+    /* ── Draw accumulated ground tracks ──────────────────────────── */
+    for (int i=0; i<NUM_SATS; i++) {
+        if (!sats[i].visible) continue;
+        const Sat *s = &sats[i];
+        if (s->gt_cnt < 2) continue;
+
+        int prev_px=-1, prev_py=-1;
+        double prev_lon=0.0;
+
+        for (int k=s->gt_cnt-1; k>=0; k--) {
+            int idx = (s->gt_head - 1 - k + GT_LEN) % GT_LEN;
+            double lat = s->gt_lat[idx];
+            double lon = s->gt_lon[idx];
+
+            int mpx = map_lon_to_px(lon);
+            int mpy = map_lat_to_py(lat);
+
+            /* Age factor: 0=oldest, 1=newest */
+            float age = 1.0f - (float)k / (float)s->gt_cnt;
+            uint8_t alpha = (uint8_t)(25 + age * age * 200);
+
+            if (prev_px >= 0) {
+                /* Antimeridian break: skip segment if longitude jump > 180° */
+                double dlon = fabs(lon - prev_lon);
+                if (dlon < PI) {
+                    SDL_SetRenderDrawColor(ren,
+                        (uint8_t)(s->el->cr * (0.4f + 0.6f*age)),
+                        (uint8_t)(s->el->cg * (0.4f + 0.6f*age)),
+                        (uint8_t)(s->el->cb * (0.4f + 0.6f*age)),
+                        alpha);
+                    SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+                }
+            }
+            prev_px=mpx; prev_py=mpy; prev_lon=lon;
+        }
+    }
+
+    /* ── Draw current sub-satellite positions ─────────────────────── */
+    for (int i=0; i<NUM_SATS; i++) {
+        if (!sats[i].visible) continue;
+        const Sat *s = &sats[i];
+
+        /* Current Earth-fixed position */
+        V3 ef  = rz(v3norm(s->pos), -earth_angle);
+        double lat = asin(fmax(-1.0,fmin(1.0,ef.z)));
+        double lon = atan2(ef.y,ef.x);
+
+        int mpx = map_lon_to_px(lon);
+        int mpy = map_lat_to_py(lat);
+
+        if (mpx<5 || mpx>=WIN_W-5 || mpy<5 || mpy>=WIN_H-5) continue;
+
+        const OrbEl *e = s->el;
+
+        /* Glow halo */
+        SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 40);
+        for (int dy=-6; dy<=6; dy++)
+            for (int dx=-6; dx<=6; dx++)
+                if (dx*dx+dy*dy<=36)
+                    SDL_RenderDrawPoint(ren, mpx+dx, mpy+dy);
+
+        /* Filled circle (radius 4) */
+        SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 255);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        for (int dy=-4; dy<=4; dy++)
+            for (int dx=-4; dx<=4; dx++)
+                if (dx*dx+dy*dy<=16)
+                    SDL_RenderDrawPoint(ren, mpx+dx, mpy+dy);
+
+        /* Crosshair extending outward */
+        SDL_RenderDrawLine(ren, mpx-9, mpy,  mpx-5, mpy);
+        SDL_RenderDrawLine(ren, mpx+5, mpy,  mpx+9, mpy);
+        SDL_RenderDrawLine(ren, mpx, mpy-9,  mpx, mpy-5);
+        SDL_RenderDrawLine(ren, mpx, mpy+5,  mpx, mpy+9);
+
+        /* White centre dot */
+        SDL_SetRenderDrawColor(ren,255,255,255,255);
+        SDL_RenderDrawPoint(ren, mpx, mpy);
+
+        /* Name label — place right of dot, flip left if near right edge */
+        int lx = (mpx + WIN_W - 196 > WIN_W - 210) ? mpx - 6*((int)strlen(e->name)+1) - 2
+                                                     : mpx + 13;
+        int ly = mpy - 4;
+        /* shadow */
+        draw_str(ren, lx+1, ly+1, e->name, 0,0,0, 1);
+        draw_str(ren, lx,   ly,   e->name, e->cr, e->cg, e->cb, 1);
+
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    }
+
+    /* ── Lat/lon axis tick labels ──────────────────────────────────── */
+    /* Latitude labels on left edge */
+    static const int lat_ticks[] = {-60,-30,0,30,60};
+    for (int t=0; t<5; t++) {
+        double lat_r = lat_ticks[t]*DEG;
+        int py = map_lat_to_py(lat_r);
+        char buf[8];
+        if (lat_ticks[t]==0) {
+            snprintf(buf,sizeof(buf),"EQ");
+        } else {
+            snprintf(buf,sizeof(buf),"%d", lat_ticks[t]);
+        }
+        /* tick line */
+        SDL_SetRenderDrawColor(ren, 50,80,60, 200);
+        SDL_RenderDrawLine(ren, 0, py, WIN_W-200, py);
+        draw_str(ren, 3, py-4, buf, 70,110,70, 1);
+    }
+    /* Longitude labels on bottom edge */
+    static const int lon_ticks[] = {-150,-120,-90,-60,-30,0,30,60,90,120,150,180};
+    for (int t=0; t<12; t++) {
+        double lon_r = lon_ticks[t]*DEG;
+        int ppx = map_lon_to_px(lon_r);
+        if (ppx < 0 || ppx >= WIN_W-200) continue;
+        char buf[8]; snprintf(buf,sizeof(buf),"%d",lon_ticks[t]);
+        SDL_SetRenderDrawColor(ren, 50,80,60, 200);
+        SDL_RenderDrawLine(ren, ppx, 0, ppx, WIN_H-28);
+        draw_str(ren, ppx-12, WIN_H-44, buf, 70,110,70, 1);
+    }
+
+    /* ── Title bar ─────────────────────────────────────────────────── */
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0,0,0, 180);
+    SDL_Rect tbar = {0, 0, WIN_W-200, 16};
+    SDL_RenderFillRect(ren, &tbar);
+    draw_str(ren, 6, 4, "GROUND TRACK MONITOR  MERCATOR PROJECTION", 60,160,80, 1);
+
+    /* ── Legend panel (right side) ─────────────────────────────────── */
+    SDL_SetRenderDrawColor(ren, 0,0,0, 200);
+    SDL_Rect panel = {WIN_W-200, 0, 200, WIN_H};
+    SDL_RenderFillRect(ren, &panel);
+
+    /* Separator line */
+    SDL_SetRenderDrawColor(ren, 40,80,50, 255);
+    SDL_RenderDrawLine(ren, WIN_W-200, 0, WIN_W-200, WIN_H);
+
+    draw_str(ren, WIN_W-196, 8,  "SATELLITE POSITIONS", 60,160,80, 1);
+    draw_str(ren, WIN_W-196, 20, "-------------------", 30,70,40, 1);
+
+    int legend_y = 34;
+    for (int i=0; i<NUM_SATS; i++) {
+        const Sat  *s = &sats[i];
+        const OrbEl*e = s->el;
+
+        /* Colour swatch */
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren,
+            s->visible ? e->cr : 40,
+            s->visible ? e->cg : 40,
+            s->visible ? e->cb : 40, 255);
+        SDL_Rect sw = {WIN_W-196, legend_y, 10, 8};
+        SDL_RenderFillRect(ren, &sw);
+
+        /* Name */
+        char nbuf[12]; snprintf(nbuf,sizeof(nbuf),"%d %s", i+1, e->name);
+        draw_str(ren, WIN_W-182, legend_y,
+                 nbuf, s->visible?e->cr:50, s->visible?e->cg:50, s->visible?e->cb:50, 1);
+
+        if (s->visible) {
+            /* Current lat/lon */
+            V3 ef  = rz(v3norm(s->pos),-earth_angle);
+            double lat_d = asin(fmax(-1.0,fmin(1.0,ef.z))) * (180.0/PI);
+            double lon_d = atan2(ef.y,ef.x) * (180.0/PI);
+            char pos[24];
+            snprintf(pos,sizeof(pos),"%.1f%c %.1f%c",
+                     fabs(lat_d), lat_d>=0?'N':'S',
+                     fabs(lon_d), lon_d>=0?'E':'W');
+            draw_str(ren, WIN_W-196, legend_y+10, pos, 120,180,120, 1);
+        }
+
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        legend_y += 26;
+    }
+
+    /* Divider before status */
+    SDL_SetRenderDrawColor(ren, 30,60,40, 200);
+    SDL_RenderDrawLine(ren, WIN_W-196, legend_y+2, WIN_W-4, legend_y+2);
+    legend_y += 8;
+
+    /* J2 and time_scale status */
+    draw_str(ren, WIN_W-196, legend_y,
+             use_j2 ? "J2: ON " : "J2: OFF",
+             use_j2?80:100, use_j2?200:100, use_j2?80:100, 1);
+
+    /* ── Bottom status bar ─────────────────────────────────────────── */
+    SDL_SetRenderDrawColor(ren, 0,0,0, 190);
+    SDL_Rect bot = {0, WIN_H-28, WIN_W-200, 28};
+    SDL_RenderFillRect(ren, &bot);
+
+    double days  = sim_time/86400.0;
+    double hours = fmod(sim_time,86400.0)/3600.0;
+    char buf[160];
+    snprintf(buf,sizeof(buf),"SIM: %4.0fD %05.2fH",days,hours);
+    draw_str(ren, 10, WIN_H-20, buf, 100,200,120, 1);
+
+    if (paused)
+        draw_str(ren, 260, WIN_H-20, "PAUSED", 255,200,50, 2);
+
+    if (recording) {
+        int blink=(frame_count/30)&1;
+        draw_str(ren, WIN_W-240, WIN_H-20, "REC",
+                 255, blink?50:0, blink?50:0, 1);
+    }
+
+    draw_str(ren, 10, WIN_H-54,
+             "+/- SPEED   SPC PAUSE   1-8 TOGGLE   J J2   P 3D VIEW   V VIDEO   Q QUIT",
+             55,90,65, 1);
+}
+
+/* ======================================================================
+   Earth sphere rendering (per-pixel raycast, streaming texture)
    ====================================================================== */
 static void render_earth(uint32_t *px, int stride,
                           double Rpx, double view_yaw, double view_pitch,
                           double earth_angle)
 {
-    int iy0 = (int)(CY - Rpx - 2), iy1 = (int)(CY + Rpx + 2);
-    int ix0 = (int)(CX - Rpx - 2), ix1 = (int)(CX + Rpx + 2);
-    if (iy0 <      0) iy0 = 0;
-    if (iy1 >= WIN_H) iy1 = WIN_H-1;
-    if (ix0 <      0) ix0 = 0;
-    if (ix1 >= WIN_W) ix1 = WIN_W-1;
+    int iy0=(int)(CY-Rpx-2), iy1=(int)(CY+Rpx+2);
+    int ix0=(int)(CX-Rpx-2), ix1=(int)(CX+Rpx+2);
+    if (iy0<0)      iy0=0;
+    if (iy1>=WIN_H) iy1=WIN_H-1;
+    if (ix0<0)      ix0=0;
+    if (ix1>=WIN_W) ix1=WIN_W-1;
 
-    for (int py = iy0; py <= iy1; py++) {
-        double ndy = (CY - py) / Rpx;
-        for (int pxx = ix0; pxx <= ix1; pxx++) {
-            double ndx = (pxx - CX) / Rpx;
-            double r2  = ndx*ndx + ndy*ndy;
-            uint32_t pixel = 0xFF000000;
+    for (int py=iy0; py<=iy1; py++) {
+        double ndy=(CY-py)/Rpx;
+        for (int pxx=ix0; pxx<=ix1; pxx++) {
+            double ndx=(pxx-CX)/Rpx, r2=ndx*ndx+ndy*ndy;
+            uint32_t pixel=0xFF000000;
 
-            if (r2 <= 1.0) {
-                double nz      = sqrt(1.0 - r2);
-                V3 N_view      = {ndx, ndy, nz};
-                V3 N_eci       = view_to_eci(N_view, view_yaw, view_pitch);
-                V3 N_earth     = rz(N_eci, -earth_angle);
-                double lat     = asin(fmax(-1.0, fmin(1.0, N_earth.z)));
-                double lon     = atan2(N_earth.y, N_earth.x);
-                int is_land    = lm_lookup(lat, lon);
-                double diffuse = fmax(0.0, N_eci.x);
-                double light   = 0.22 + 0.78 * diffuse;
-                double lat_deg = lat * (180.0/PI);
-                double abslat  = fabs(lat_deg);
-                double fr, fg, fb;
-
+            if (r2<=1.0) {
+                double nz=sqrt(1.0-r2);
+                V3 N_view={ndx,ndy,nz};
+                V3 N_eci=view_to_eci(N_view,view_yaw,view_pitch);
+                V3 N_earth=rz(N_eci,-earth_angle);
+                double lat=asin(fmax(-1.0,fmin(1.0,N_earth.z)));
+                double lon=atan2(N_earth.y,N_earth.x);
+                int is_land=lm_lookup(lat,lon);
+                double diffuse=fmax(0.0,N_eci.x);
+                double light=0.22+0.78*diffuse;
+                double lat_deg=lat*(180.0/PI), abslat=fabs(lat_deg);
+                double fr,fg,fb;
                 if (is_land) {
-                    if (abslat > 65.0) {
-                        fr = 220; fg = 225; fb = 240;
-                    } else {
-                        double t = fmax(0.0, 1.0 - abslat/65.0);
-                        fr = 35 + 20*(1-t); fg = 100 + 30*t; fb = 20;
-                    }
-                } else {
-                    fr = 5; fg = 40; fb = 130;
-                }
-
-                fr *= light; fg *= light; fb *= light;
-
-                if (abslat > 70.0) {
-                    double f = (abslat - 70.0) / 20.0;
-                    fr += f*(230-fr); fg += f*(235-fg); fb += f*(245-fb);
-                }
-
-                double lo30 = fmod(fabs(lon*(180.0/PI)), 30.0);
-                double la30 = fmod(abslat, 30.0);
-                if (la30 < 0.7 || lo30 < 0.7) {
-                    fr *= 0.75; fg *= 0.75; fb = fb*0.75 + 15;
-                }
-
-                double glow = (1.0 - nz);
-                glow = glow*glow*glow * 0.18;
-                fb += glow*180; fg += glow*80; fr += glow*20;
-
-                pixel = 0xFF000000
-                      | ((uint32_t)(uint8_t)fmin(255,fr) << 16)
-                      | ((uint32_t)(uint8_t)fmin(255,fg) <<  8)
-                      |  (uint32_t)(uint8_t)fmin(255,fb);
-
-            } else if (r2 <= 1.055) {
-                double rl   = sqrt(r2);
-                double glow = (1.055 - rl) / 0.055;
-                glow = glow*glow;
-                pixel = 0xFF000000
-                      | ((uint32_t)(uint8_t)(glow*10) << 16)
-                      | ((uint32_t)(uint8_t)(glow*35) <<  8)
-                      |  (uint32_t)(uint8_t)(glow*70);
+                    if (abslat>65.0) { fr=220;fg=225;fb=240; }
+                    else { double t=fmax(0.0,1.0-abslat/65.0); fr=35+20*(1-t);fg=100+30*t;fb=20; }
+                } else { fr=5;fg=40;fb=130; }
+                fr*=light; fg*=light; fb*=light;
+                if (abslat>70.0) { double f=(abslat-70.0)/20.0; fr+=f*(230-fr);fg+=f*(235-fg);fb+=f*(245-fb); }
+                double lo30=fmod(fabs(lon*(180.0/PI)),30.0), la30=fmod(abslat,30.0);
+                if (la30<0.7||lo30<0.7) { fr*=0.75;fg*=0.75;fb=fb*0.75+15; }
+                double glow=(1.0-nz); glow=glow*glow*glow*0.18;
+                fb+=glow*180; fg+=glow*80; fr+=glow*20;
+                pixel=0xFF000000|((uint32_t)(uint8_t)fmin(255,fr)<<16)
+                      |((uint32_t)(uint8_t)fmin(255,fg)<<8)|(uint8_t)fmin(255,fb);
+            } else if (r2<=1.055) {
+                double rl=sqrt(r2), glow=((1.055-rl)/0.055); glow=glow*glow;
+                pixel=0xFF000000|((uint32_t)(uint8_t)(glow*10)<<16)
+                      |((uint32_t)(uint8_t)(glow*35)<<8)|(uint8_t)(glow*70);
             }
-
-            px[py * stride + pxx] = pixel;
+            px[py*stride+pxx]=pixel;
         }
     }
 }
 
 /* ======================================================================
-   Orbit path (analytical)
+   Orbit path (analytical Keplerian ellipse)
    ====================================================================== */
 static void render_orbit(SDL_Renderer *ren, const OrbEl *el,
                           double Rpx, double view_yaw, double view_pitch)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    int psx = 0, psy = 0, pocc = 0;
-    for (int j = 0; j <= ORBIT_PTS; j++) {
-        double nu  = j * (2.0*PI / ORBIT_PTS);
-        V3 pv      = eci_to_view(orbit_pos_eci(el, nu), view_yaw, view_pitch);
-        int sx     = px_x(pv, Rpx);
-        int sy     = px_y(pv, Rpx);
-        int occ    = occluded(pv, Rpx);
-        if (j > 0) {
-            SDL_SetRenderDrawColor(ren, el->cr, el->cg, el->cb,
-                                   (uint8_t)(occ && pocc ? 40 : 130));
-            SDL_RenderDrawLine(ren, psx, psy, sx, sy);
+    int psx=0,psy=0,pocc=0;
+    for (int j=0; j<=ORBIT_PTS; j++) {
+        double nu=j*(2.0*PI/ORBIT_PTS);
+        V3 pv=eci_to_view(orbit_pos_eci(el,nu),view_yaw,view_pitch);
+        int sx=px_x(pv,Rpx), sy=px_y(pv,Rpx), occ=occluded(pv,Rpx);
+        if (j>0) {
+            SDL_SetRenderDrawColor(ren,el->cr,el->cg,el->cb,(uint8_t)(occ&&pocc?40:130));
+            SDL_RenderDrawLine(ren,psx,psy,sx,sy);
         }
-        psx = sx; psy = sy; pocc = occ;
+        psx=sx; psy=sy; pocc=occ;
     }
 }
 
 /* ======================================================================
-   Ground track: sub-satellite point on sphere + nadir line
+   Ground tracks on 3D sphere (nadir line + dot on surface)
    ====================================================================== */
 static void render_ground_tracks(SDL_Renderer *ren,
                                   const Sat sats[NUM_SATS],
-                                  double Rpx,
-                                  double view_yaw, double view_pitch,
+                                  double Rpx, double view_yaw, double view_pitch,
                                   double earth_angle)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    for (int i = 0; i < NUM_SATS; i++) {
+    for (int i=0; i<NUM_SATS; i++) {
         if (!sats[i].visible) continue;
-
-        /* Sub-satellite point: satellite ECI pos → Earth-fixed unit → back to ECI at RE */
-        V3 ef   = rz(v3norm(sats[i].pos), -earth_angle);
-        V3 surf = v3scl(rz(ef, earth_angle), RE);
-        V3 sv   = eci_to_view(surf, view_yaw, view_pitch);
-
-        /* Only draw if ground point faces camera */
-        if (sv.z <= 0.0) continue;
-
-        int gx = px_x(sv, Rpx);
-        int gy = px_y(sv, Rpx);
-        if (gx < 3 || gx >= WIN_W-3 || gy < 3 || gy >= WIN_H-3) continue;
-
-        const OrbEl *e = sats[i].el;
-
-        /* Nadir line */
-        V3 satv = eci_to_view(sats[i].pos, view_yaw, view_pitch);
-        if (!occluded(satv, Rpx)) {
-            SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 55);
-            SDL_RenderDrawLine(ren, px_x(satv, Rpx), px_y(satv, Rpx), gx, gy);
+        V3 ef   = rz(v3norm(sats[i].pos),-earth_angle);
+        V3 surf = v3scl(rz(ef,earth_angle),RE);
+        V3 sv   = eci_to_view(surf,view_yaw,view_pitch);
+        if (sv.z<=0.0) continue;
+        int gx=px_x(sv,Rpx), gy=px_y(sv,Rpx);
+        if (gx<3||gx>=WIN_W-3||gy<3||gy>=WIN_H-3) continue;
+        const OrbEl *e=sats[i].el;
+        V3 satv=eci_to_view(sats[i].pos,view_yaw,view_pitch);
+        if (!occluded(satv,Rpx)) {
+            SDL_SetRenderDrawColor(ren,e->cr,e->cg,e->cb,55);
+            SDL_RenderDrawLine(ren,px_x(satv,Rpx),px_y(satv,Rpx),gx,gy);
         }
-
-        /* Ground track dot (coloured ring) */
-        SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 220);
-        SDL_Rect outer = {gx-3, gy-3, 7, 7};
-        SDL_RenderFillRect(ren, &outer);
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 220);
-        SDL_Rect inner = {gx-1, gy-1, 3, 3};
-        SDL_RenderFillRect(ren, &inner);
+        SDL_SetRenderDrawColor(ren,e->cr,e->cg,e->cb,220);
+        SDL_Rect outer={gx-3,gy-3,7,7}; SDL_RenderFillRect(ren,&outer);
+        SDL_SetRenderDrawColor(ren,0,0,0,220);
+        SDL_Rect inner={gx-1,gy-1,3,3}; SDL_RenderFillRect(ren,&inner);
     }
 }
 
 /* ======================================================================
-   Trail + satellite dot
+   Satellite trail + dot (3D view)
    ====================================================================== */
 static void render_satellite(SDL_Renderer *ren, const Sat *s,
                               double Rpx, double view_yaw, double view_pitch)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    for (int k = 0; k < s->trail_cnt; k++) {
-        int idx = (s->trail_head - 1 - k + TRAIL_LEN) % TRAIL_LEN;
-        V3 tv = eci_to_view(s->trail[idx], view_yaw, view_pitch);
-        if (occluded(tv, Rpx)) continue;
-        int tsx = px_x(tv, Rpx), tsy = px_y(tv, Rpx);
-        if (tsx < 0 || tsx >= WIN_W || tsy < 0 || tsy >= WIN_H) continue;
-        float f = 1.0f - (float)k / (float)s->trail_cnt;
-        SDL_SetRenderDrawColor(ren,
-            (uint8_t)(s->el->cr * f),
-            (uint8_t)(s->el->cg * f),
-            (uint8_t)(s->el->cb * f),
-            (uint8_t)(f*f*180));
-        SDL_RenderDrawPoint(ren, tsx, tsy);
+    for (int k=0; k<s->trail_cnt; k++) {
+        int idx=(s->trail_head-1-k+TRAIL_LEN)%TRAIL_LEN;
+        V3 tv=eci_to_view(s->trail[idx],view_yaw,view_pitch);
+        if (occluded(tv,Rpx)) continue;
+        int tsx=px_x(tv,Rpx),tsy=px_y(tv,Rpx);
+        if (tsx<0||tsx>=WIN_W||tsy<0||tsy>=WIN_H) continue;
+        float f=1.0f-(float)k/(float)s->trail_cnt;
+        SDL_SetRenderDrawColor(ren,(uint8_t)(s->el->cr*f),(uint8_t)(s->el->cg*f),
+                               (uint8_t)(s->el->cb*f),(uint8_t)(f*f*180));
+        SDL_RenderDrawPoint(ren,tsx,tsy);
     }
-
-    V3 sv = eci_to_view(s->pos, view_yaw, view_pitch);
-    if (occluded(sv, Rpx)) return;
-    int sx = px_x(sv, Rpx), sy = px_y(sv, Rpx);
-    if (sx < 4 || sx >= WIN_W-4 || sy < 4 || sy >= WIN_H-4) return;
-
-    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
-    SDL_SetRenderDrawColor(ren, s->el->cr, s->el->cg, s->el->cb, 255);
-    SDL_RenderDrawLine(ren, sx-4, sy,   sx+4, sy);
-    SDL_RenderDrawLine(ren, sx,   sy-4, sx,   sy+4);
-    SDL_RenderDrawLine(ren, sx-3, sy-3, sx+3, sy+3);
-    SDL_RenderDrawLine(ren, sx+3, sy-3, sx-3, sy+3);
-    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
-    SDL_Rect dot = {sx-1, sy-1, 3, 3};
-    SDL_RenderFillRect(ren, &dot);
+    V3 sv=eci_to_view(s->pos,view_yaw,view_pitch);
+    if (occluded(sv,Rpx)) return;
+    int sx=px_x(sv,Rpx),sy=px_y(sv,Rpx);
+    if (sx<4||sx>=WIN_W-4||sy<4||sy>=WIN_H-4) return;
+    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren,s->el->cr,s->el->cg,s->el->cb,255);
+    SDL_RenderDrawLine(ren,sx-4,sy,sx+4,sy);
+    SDL_RenderDrawLine(ren,sx,sy-4,sx,sy+4);
+    SDL_RenderDrawLine(ren,sx-3,sy-3,sx+3,sy+3);
+    SDL_RenderDrawLine(ren,sx+3,sy-3,sx-3,sy+3);
+    SDL_SetRenderDrawColor(ren,255,255,255,255);
+    SDL_Rect dot={sx-1,sy-1,3,3}; SDL_RenderFillRect(ren,&dot);
 }
 
 /* ======================================================================
-   HUD
+   3D HUD
    ====================================================================== */
 static void render_hud(SDL_Renderer *ren,
                         const Sat sats[NUM_SATS],
@@ -641,284 +920,272 @@ static void render_hud(SDL_Renderer *ren,
                         uint32_t frame_count)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 180);
-    SDL_Rect bg = {WIN_W-200, 10, 190, NUM_SATS*26 + 72};
-    SDL_RenderFillRect(ren, &bg);
+    SDL_SetRenderDrawColor(ren,0,0,0,180);
+    SDL_Rect bg={WIN_W-200,10,190,NUM_SATS*26+72};
+    SDL_RenderFillRect(ren,&bg);
 
-    draw_str(ren, WIN_W-196, 14, "ORBITS", 200, 200, 200, 1);
+    draw_str(ren,WIN_W-196,14,"ORBITS",200,200,200,1);
 
-    for (int i = 0; i < NUM_SATS; i++) {
-        int y = 28 + i*26;
-        const OrbEl *e = sats[i].el;
-        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    for (int i=0; i<NUM_SATS; i++) {
+        int y=28+i*26;
+        const OrbEl *e=sats[i].el;
+        SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_NONE);
         SDL_SetRenderDrawColor(ren,
-            sats[i].visible ? e->cr : 60,
-            sats[i].visible ? e->cg : 60,
-            sats[i].visible ? e->cb : 60, 255);
-        SDL_Rect sw = {WIN_W-196, y+1, 12, 9};
-        SDL_RenderFillRect(ren, &sw);
-        char label[32];
-        snprintf(label, sizeof(label), "%d %s", i+1, e->name);
-        draw_str(ren, WIN_W-180, y,
-                 label,
-                 sats[i].visible ? e->cr : 80,
-                 sats[i].visible ? e->cg : 80,
-                 sats[i].visible ? e->cb : 80, 1);
+            sats[i].visible?e->cr:60, sats[i].visible?e->cg:60, sats[i].visible?e->cb:60,255);
+        SDL_Rect sw={WIN_W-196,y+1,12,9}; SDL_RenderFillRect(ren,&sw);
+        char label[32]; snprintf(label,sizeof(label),"%d %s",i+1,e->name);
+        draw_str(ren,WIN_W-180,y,label,
+                 sats[i].visible?e->cr:80, sats[i].visible?e->cg:80, sats[i].visible?e->cb:80,1);
     }
 
-    /* Toggle status row */
-    int ty = 28 + NUM_SATS*26 + 6;
-    draw_str(ren, WIN_W-196, ty, "J2:", 150, 150, 150, 1);
-    draw_str(ren, WIN_W-172, ty,
-             use_j2 ? "ON " : "OFF",
-             use_j2 ? 80  : 150,
-             use_j2 ? 210 : 150,
-             use_j2 ? 80  : 150, 1);
-    draw_str(ren, WIN_W-140, ty, "GT:", 150, 150, 150, 1);
-    draw_str(ren, WIN_W-116, ty,
-             show_gt ? "ON " : "OFF",
-             show_gt ? 80  : 150,
-             show_gt ? 210 : 150,
-             show_gt ? 80  : 150, 1);
+    int ty=28+NUM_SATS*26+6;
+    draw_str(ren,WIN_W-196,ty,"J2:",150,150,150,1);
+    draw_str(ren,WIN_W-172,ty, use_j2?"ON ":"OFF", use_j2?80:150, use_j2?210:150, use_j2?80:150,1);
+    draw_str(ren,WIN_W-140,ty,"GT:",150,150,150,1);
+    draw_str(ren,WIN_W-116,ty, show_gt?"ON ":"OFF", show_gt?80:150, show_gt?210:150, show_gt?80:150,1);
 
-    /* Status bar */
     char buf[160];
-    double days  = sim_time / 86400.0;
-    double hours = fmod(sim_time, 86400.0) / 3600.0;
-    snprintf(buf, sizeof(buf), "SPEED: %gX", time_scale);
-    draw_str(ren, 10, WIN_H-22, buf, 180, 220, 180, 1);
-    snprintf(buf, sizeof(buf), "SIM: %4.0fD %05.2fH", days, hours);
-    draw_str(ren, 160, WIN_H-22, buf, 180, 180, 220, 1);
+    double days=sim_time/86400.0, hours=fmod(sim_time,86400.0)/3600.0;
+    snprintf(buf,sizeof(buf),"SPEED: %gX",time_scale);
+    draw_str(ren,10,WIN_H-22,buf,180,220,180,1);
+    snprintf(buf,sizeof(buf),"SIM: %4.0fD %05.2fH",days,hours);
+    draw_str(ren,160,WIN_H-22,buf,180,180,220,1);
 
-    if (paused) draw_str(ren, 420, WIN_H-22, "PAUSED", 255, 200, 50, 2);
+    if (paused) draw_str(ren,420,WIN_H-22,"PAUSED",255,200,50,2);
 
-    /* Blinking REC indicator */
     if (recording) {
-        int blink = (frame_count / 30) & 1;
-        draw_str(ren, WIN_W-200, WIN_H-22, "REC",
-                 255, blink ? 50 : 0, blink ? 50 : 0, 1);
+        int blink=(frame_count/30)&1;
+        draw_str(ren,WIN_W-200,WIN_H-22,"REC",255,blink?50:0,blink?50:0,1);
     }
 
-    /* Controls hints */
-    draw_str(ren, 10, WIN_H-50,
-             "+/- SPEED   R RESET   SPC PAUSE   1-8 TOGGLE   SCROLL ZOOM",
-             85, 85, 85, 1);
-    draw_str(ren, 10, WIN_H-38,
-             "J J2   G GROUND TRACK   V VIDEO CAPTURE   Q/ESC QUIT",
-             85, 85, 85, 1);
+    draw_str(ren,10,WIN_H-50,
+             "+/- SPEED   R RESET   SPC PAUSE   1-8 TOGGLE   SCROLL ZOOM",85,85,85,1);
+    draw_str(ren,10,WIN_H-38,
+             "J J2   G GROUND TRACK   P MAP VIEW   V VIDEO   Q/ESC QUIT",85,85,85,1);
 }
 
 /* ======================================================================
    ffmpeg video capture
    ====================================================================== */
 static FILE   *ffmpeg_pipe = NULL;
-static uint8_t frame_buf[WIN_W * WIN_H * 4];   /* ARGB read buffer */
+static uint8_t frame_buf[WIN_W * WIN_H * 4];
 
 static int video_start(void) {
     char fname[80], cmd[512];
-    time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
-    strftime(fname, sizeof(fname), "earth_orbit_%Y%m%d_%H%M%S.mp4", tm);
-    snprintf(cmd, sizeof(cmd),
+    time_t t=time(NULL);
+    struct tm *tm=localtime(&t);
+    strftime(fname,sizeof(fname),"earth_orbit_%Y%m%d_%H%M%S.mp4",tm);
+    snprintf(cmd,sizeof(cmd),
         "ffmpeg -y -f rawvideo -pixel_format rgb24 "
         "-video_size %dx%d -framerate 60 -i pipe:0 "
         "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "
         "'%s' 2>/dev/null",
         WIN_W, WIN_H, fname);
-    ffmpeg_pipe = popen(cmd, "w");
-    if (!ffmpeg_pipe) {
-        fprintf(stderr, "video_start: popen failed — is ffmpeg in PATH?\n");
-        return 0;
-    }
-    printf("Recording to: %s\n", fname);
+    ffmpeg_pipe=popen(cmd,"w");
+    if (!ffmpeg_pipe) { fprintf(stderr,"video_start: popen failed\n"); return 0; }
+    printf("Recording to: %s\n",fname);
     return 1;
 }
 
 static void video_stop(void) {
     if (!ffmpeg_pipe) return;
-    pclose(ffmpeg_pipe);
-    ffmpeg_pipe = NULL;
+    pclose(ffmpeg_pipe); ffmpeg_pipe=NULL;
     printf("Recording stopped.\n");
 }
 
-/* Read current renderer content and pipe RGB24 to ffmpeg.
-   SDL_RenderReadPixels is slow but fine for 60 fps at 1200x780. */
 static void video_frame(SDL_Renderer *ren) {
     if (!ffmpeg_pipe) return;
-    /* Read as RGB24 directly — SDL packs 3 bytes per pixel */
-    SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_RGB24,
-                         frame_buf, WIN_W * 3);
-    fwrite(frame_buf, (size_t)WIN_W * WIN_H * 3, 1, ffmpeg_pipe);
+    SDL_RenderReadPixels(ren,NULL,SDL_PIXELFORMAT_RGB24,frame_buf,WIN_W*3);
+    fwrite(frame_buf,(size_t)WIN_W*WIN_H*3,1,ffmpeg_pipe);
 }
 
 /* ======================================================================
    Main
    ====================================================================== */
 int main(void) {
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
-        return 1;
+    if (SDL_Init(SDL_INIT_VIDEO)<0) {
+        fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1;
     }
 
-    SDL_Window *win = SDL_CreateWindow(
+    SDL_Window *win=SDL_CreateWindow(
         "Earth Satellite Orbit Simulation",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_SHOWN);
-    if (!win) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+        SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
+        WIN_W,WIN_H,SDL_WINDOW_SHOWN);
+    if (!win) { fprintf(stderr,"SDL_CreateWindow: %s\n",SDL_GetError()); return 1; }
 
-    SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!ren) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
+    SDL_Renderer *ren=SDL_CreateRenderer(win,-1,
+        SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) { fprintf(stderr,"SDL_CreateRenderer: %s\n",SDL_GetError()); return 1; }
 
-    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
 
-    SDL_Texture *earth_tex = SDL_CreateTexture(ren,
-        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-        WIN_W, WIN_H);
-    if (!earth_tex) { fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return 1; }
+    SDL_Texture *earth_tex=SDL_CreateTexture(ren,
+        SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,WIN_W,WIN_H);
+    if (!earth_tex) { fprintf(stderr,"SDL_CreateTexture: %s\n",SDL_GetError()); return 1; }
 
     printf("Building land mask..."); fflush(stdout);
     build_land_mask();
     printf(" done\n");
+
+    /* Mercator y-range */
+    g_map_y_max = log(tan(PI/4.0 + MAP_LAT_CLIP/2.0));
+
+    printf("Building Mercator map texture..."); fflush(stdout);
+    SDL_Texture *map_tex = build_mercator_texture(ren);
+    if (!map_tex) { fprintf(stderr,"build_mercator_texture failed\n"); return 1; }
+    printf(" done\n");
+
     build_stars();
 
     Sat sats[NUM_SATS];
-    for (int i = 0; i < NUM_SATS; i++) sat_init(&sats[i], &ORBITS[i]);
+    for (int i=0; i<NUM_SATS; i++) sat_init(&sats[i],&ORBITS[i]);
 
-    double view_yaw    = 0.2;
-    double view_pitch  = 0.45;
-    double zoom        = ZOOM_INIT;
-    double earth_angle = 0.0;
-    double sim_time    = 0.0;
-    double sim_acc     = 0.0;
-    double time_scale  = 800.0;
+    double view_yaw   = 0.2;
+    double view_pitch = 0.45;
+    double zoom       = ZOOM_INIT;
+    double earth_angle= 0.0;
+    double sim_time   = 0.0;
+    double sim_acc    = 0.0;
+    double time_scale = 800.0;
 
     int paused            = 0;
     int dragging          = 0;
-    int mx_prev           = 0, my_prev = 0;
+    int mx_prev=0, my_prev=0;
     int use_j2            = 0;
     int show_ground_track = 0;
+    int map_mode          = 0;   /* P toggle */
     int recording         = 0;
     uint32_t frame_count  = 0;
 
-    uint32_t t_prev = SDL_GetTicks();
-    int running = 1;
+    uint32_t t_prev=SDL_GetTicks();
+    int running=1;
     SDL_Event ev;
 
     while (running) {
-        /* ── Events ──────────────────────────────────────── */
+        /* ── Events ───────────────────────────────────── */
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
-            case SDL_QUIT: running = 0; break;
+            case SDL_QUIT: running=0; break;
             case SDL_KEYDOWN:
                 switch (ev.key.keysym.sym) {
-                case SDLK_ESCAPE: case SDLK_q:
-                    running = 0; break;
-                case SDLK_SPACE:
-                    paused = !paused; break;
+                case SDLK_ESCAPE: case SDLK_q: running=0; break;
+                case SDLK_SPACE:  paused=!paused; break;
+                case SDLK_p:      map_mode=!map_mode; break;
                 case SDLK_r:
-                    view_yaw = 0.2; view_pitch = 0.45; zoom = ZOOM_INIT; break;
+                    if (!map_mode) { view_yaw=0.2;view_pitch=0.45;zoom=ZOOM_INIT; }
+                    break;
                 case SDLK_EQUALS: case SDLK_PLUS:
-                    time_scale = fmin(time_scale * 2.0, 1e6); break;
+                    time_scale=fmin(time_scale*2.0,1e6); break;
                 case SDLK_MINUS:
-                    time_scale = fmax(time_scale / 2.0, 1.0); break;
+                    time_scale=fmax(time_scale/2.0,1.0); break;
                 case SDLK_j:
-                    use_j2 = !use_j2;
-                    printf("J2: %s\n", use_j2 ? "ON" : "OFF"); break;
+                    use_j2=!use_j2;
+                    printf("J2: %s\n",use_j2?"ON":"OFF"); break;
                 case SDLK_g:
-                    show_ground_track = !show_ground_track; break;
+                    if (!map_mode) show_ground_track=!show_ground_track;
+                    break;
                 case SDLK_v:
-                    if (!recording) { if (video_start()) recording = 1; }
-                    else            { video_stop(); recording = 0; }
+                    if (!recording) { if (video_start()) recording=1; }
+                    else            { video_stop(); recording=0; }
                     break;
                 case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
                 case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: {
-                    int idx = ev.key.keysym.sym - SDLK_1;
-                    if (idx < NUM_SATS) sats[idx].visible ^= 1;
+                    int idx=ev.key.keysym.sym-SDLK_1;
+                    if (idx<NUM_SATS) sats[idx].visible^=1;
                     break; }
                 }
                 break;
             case SDL_MOUSEBUTTONDOWN:
-                if (ev.button.button == SDL_BUTTON_LEFT) {
-                    dragging = 1; mx_prev = ev.button.x; my_prev = ev.button.y;
+                if (!map_mode && ev.button.button==SDL_BUTTON_LEFT) {
+                    dragging=1; mx_prev=ev.button.x; my_prev=ev.button.y;
                 }
                 break;
             case SDL_MOUSEBUTTONUP:
-                if (ev.button.button == SDL_BUTTON_LEFT) dragging = 0;
+                if (ev.button.button==SDL_BUTTON_LEFT) dragging=0;
                 break;
             case SDL_MOUSEMOTION:
-                if (dragging) {
-                    view_yaw   += (ev.motion.x - mx_prev) * 0.006;
-                    view_pitch += (ev.motion.y - my_prev) * 0.006;
-                    view_pitch  = fmax(-PI/2.0+0.05, fmin(PI/2.0-0.05, view_pitch));
-                    mx_prev = ev.motion.x; my_prev = ev.motion.y;
+                if (!map_mode && dragging) {
+                    view_yaw  +=(ev.motion.x-mx_prev)*0.006;
+                    view_pitch+=(ev.motion.y-my_prev)*0.006;
+                    view_pitch =fmax(-PI/2.0+0.05,fmin(PI/2.0-0.05,view_pitch));
+                    mx_prev=ev.motion.x; my_prev=ev.motion.y;
                 }
                 break;
             case SDL_MOUSEWHEEL:
-                zoom *= (ev.wheel.y > 0) ? 1.12 : (1.0/1.12);
-                zoom  = fmax(ZOOM_MIN, fmin(ZOOM_MAX, zoom));
+                if (!map_mode) {
+                    zoom*=(ev.wheel.y>0)?1.12:(1.0/1.12);
+                    zoom=fmax(ZOOM_MIN,fmin(ZOOM_MAX,zoom));
+                }
                 break;
             }
         }
 
-        /* ── Physics ─────────────────────────────────────── */
-        uint32_t t_now   = SDL_GetTicks();
-        double   dt_real = (t_now - t_prev) * 0.001;
-        if (dt_real > 0.1) dt_real = 0.1;
-        t_prev = t_now;
+        /* ── Physics ──────────────────────────────────── */
+        uint32_t t_now=SDL_GetTicks();
+        double dt_real=(t_now-t_prev)*0.001;
+        if (dt_real>0.1) dt_real=0.1;
+        t_prev=t_now;
 
         if (!paused) {
-            sim_acc += time_scale * dt_real;
-            int steps = 0;
-            while (sim_acc >= DT_PHYS && steps < 600) {
-                for (int i = 0; i < NUM_SATS; i++)
-                    if (sats[i].visible) sat_step(&sats[i], DT_PHYS, use_j2);
-                earth_angle += OMEGA_E * DT_PHYS;
-                sim_time    += DT_PHYS;
-                sim_acc     -= DT_PHYS;
+            sim_acc+=time_scale*dt_real;
+            int steps=0;
+            while (sim_acc>=DT_PHYS && steps<600) {
+                for (int i=0; i<NUM_SATS; i++)
+                    if (sats[i].visible)
+                        sat_step(&sats[i],DT_PHYS,use_j2,earth_angle);
+                earth_angle+=OMEGA_E*DT_PHYS;
+                sim_time   +=DT_PHYS;
+                sim_acc    -=DT_PHYS;
                 steps++;
             }
         }
 
-        /* ── Render ──────────────────────────────────────── */
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        /* ── Render ───────────────────────────────────── */
+        SDL_SetRenderDrawColor(ren,0,0,0,255);
         SDL_RenderClear(ren);
 
-        for (int i = 0; i < N_STARS; i++) {
-            SDL_SetRenderDrawColor(ren, star_b[i], star_b[i], star_b[i], 255);
-            SDL_RenderDrawPoint(ren, star_x[i], star_y[i]);
+        if (map_mode) {
+            /* ── 2D Mercator map mode ─────────────────── */
+            render_map_view(ren,map_tex,sats,
+                            earth_angle,sim_time,paused,
+                            use_j2,recording,frame_count);
+        } else {
+            /* ── 3D sphere mode ───────────────────────── */
+            for (int i=0; i<N_STARS; i++) {
+                SDL_SetRenderDrawColor(ren,star_b[i],star_b[i],star_b[i],255);
+                SDL_RenderDrawPoint(ren,star_x[i],star_y[i]);
+            }
+
+            double Rpx=BASE_R*zoom;
+            void *raw; int pitch;
+            SDL_LockTexture(earth_tex,NULL,&raw,&pitch);
+            memset(raw,0,(size_t)pitch*WIN_H);
+            render_earth((uint32_t*)raw,pitch/4,Rpx,view_yaw,view_pitch,earth_angle);
+            SDL_UnlockTexture(earth_tex);
+            SDL_RenderCopy(ren,earth_tex,NULL,NULL);
+
+            for (int i=0; i<NUM_SATS; i++)
+                if (sats[i].visible)
+                    render_orbit(ren,sats[i].el,Rpx,view_yaw,view_pitch);
+
+            if (show_ground_track)
+                render_ground_tracks(ren,sats,Rpx,view_yaw,view_pitch,earth_angle);
+
+            for (int i=0; i<NUM_SATS; i++)
+                if (sats[i].visible)
+                    render_satellite(ren,&sats[i],Rpx,view_yaw,view_pitch);
+
+            render_hud(ren,sats,time_scale,sim_time,
+                       paused,use_j2,show_ground_track,recording,frame_count);
         }
 
-        double Rpx = BASE_R * zoom;
-        void *raw; int pitch;
-        SDL_LockTexture(earth_tex, NULL, &raw, &pitch);
-        memset(raw, 0, (size_t)pitch * WIN_H);
-        render_earth((uint32_t*)raw, pitch/4,
-                     Rpx, view_yaw, view_pitch, earth_angle);
-        SDL_UnlockTexture(earth_tex);
-        SDL_RenderCopy(ren, earth_tex, NULL, NULL);
-
-        for (int i = 0; i < NUM_SATS; i++)
-            if (sats[i].visible)
-                render_orbit(ren, sats[i].el, Rpx, view_yaw, view_pitch);
-
-        if (show_ground_track)
-            render_ground_tracks(ren, sats, Rpx, view_yaw, view_pitch, earth_angle);
-
-        for (int i = 0; i < NUM_SATS; i++)
-            if (sats[i].visible)
-                render_satellite(ren, &sats[i], Rpx, view_yaw, view_pitch);
-
-        render_hud(ren, sats, time_scale, sim_time,
-                   paused, use_j2, show_ground_track, recording, frame_count);
-
         if (recording) video_frame(ren);
-
         SDL_RenderPresent(ren);
         frame_count++;
     }
 
     if (recording) video_stop();
+    SDL_DestroyTexture(map_tex);
     SDL_DestroyTexture(earth_tex);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
