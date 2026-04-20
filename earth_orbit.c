@@ -47,11 +47,14 @@
 #define NUM_SATS   8
 #define TRAIL_LEN  500
 #define TRAIL_STEP   5
-#define ORBIT_PTS  360
+#define ORBIT_PTS  7200        /* 20 pts/deg — sub-2px segments at max zoom (8×) */
 
 /* Ground track history — 1500 samples × 100 s/sample ≈ 41.7 h.
-   Enough for ≥1 full orbit of every satellite type. */
-#define GT_LEN   1500
+   Enough for ≥1 full orbit of every satellite type.
+   GT_BREAK is a sentinel lat value written into the ring buffer when a
+   satellite is re-enabled, so the drawing code can skip that segment.  */
+#define GT_LEN    1500
+#define GT_BREAK  99.0f   /* sentinel: valid lat range is ±π/2 ≈ ±1.57 */
 
 /* Mercator map clipped to ±82° latitude, right edge leaves room for panel */
 #define MAP_LAT_CLIP (82.0 * DEG)
@@ -153,6 +156,7 @@ static inline V3     v3scl(V3 a, double s){ return (V3){a.x*s,a.y*s,a.z*s}; }
 static inline double v3dot(V3 a, V3 b)    { return a.x*b.x+a.y*b.y+a.z*b.z; }
 static inline double v3len(V3 a)           { return sqrt(v3dot(a,a)); }
 static inline V3     v3norm(V3 a)         { double l=v3len(a); return v3scl(a,1.0/l); }
+static inline V3     v3cross(V3 a, V3 b)  { return (V3){a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 
 static V3 rx(V3 v, double a) {
     double c=cos(a),s=sin(a);
@@ -466,6 +470,200 @@ static const OrbEl ORBITS[NUM_SATS] = {
 };
 
 /* ======================================================================
+   Full GPS constellation  —  Walker 24/6/2
+   Forward declarations needed by footprint/GPS map renderers below.
+   ====================================================================== */
+static int map_lon_to_px(double lon);
+static int map_lat_to_py(double lat);
+#define GPS_N 24
+
+/* Plane colours (dim, so they don't overwhelm the main 8 sats) */
+#define GPS_CR0 100  /* plane A – blue   */
+#define GPS_CG0 140
+#define GPS_CB0 255
+#define GPS_CR1 100  /* plane B – green  */
+#define GPS_CG1 220
+#define GPS_CB1 140
+#define GPS_CR2 220  /* plane C – pink   */
+#define GPS_CG2 100
+#define GPS_CB2 160
+#define GPS_CR3 100  /* plane D – cyan   */
+#define GPS_CG3 220
+#define GPS_CB3 220
+#define GPS_CR4 220  /* plane E – yellow */
+#define GPS_CG4 190
+#define GPS_CB4  80
+#define GPS_CR5 180  /* plane F – purple */
+#define GPS_CG5 100
+#define GPS_CB5 220
+
+static const OrbEl GPS_ORBITS[GPS_N] = {
+/* a(m)           e     i           Omega      omega  M0          name  R          G          B         */
+/* Plane A  Ω=  0°  offset M=  0° */
+{26559750.0,0.0,55.0*DEG,  0.0*DEG,0.0,  0.0*DEG,"GPS",GPS_CR0,GPS_CG0,GPS_CB0},
+{26559750.0,0.0,55.0*DEG,  0.0*DEG,0.0, 90.0*DEG,"GPS",GPS_CR0,GPS_CG0,GPS_CB0},
+{26559750.0,0.0,55.0*DEG,  0.0*DEG,0.0,180.0*DEG,"GPS",GPS_CR0,GPS_CG0,GPS_CB0},
+{26559750.0,0.0,55.0*DEG,  0.0*DEG,0.0,270.0*DEG,"GPS",GPS_CR0,GPS_CG0,GPS_CB0},
+/* Plane B  Ω= 60°  offset M= 30° */
+{26559750.0,0.0,55.0*DEG, 60.0*DEG,0.0, 30.0*DEG,"GPS",GPS_CR1,GPS_CG1,GPS_CB1},
+{26559750.0,0.0,55.0*DEG, 60.0*DEG,0.0,120.0*DEG,"GPS",GPS_CR1,GPS_CG1,GPS_CB1},
+{26559750.0,0.0,55.0*DEG, 60.0*DEG,0.0,210.0*DEG,"GPS",GPS_CR1,GPS_CG1,GPS_CB1},
+{26559750.0,0.0,55.0*DEG, 60.0*DEG,0.0,300.0*DEG,"GPS",GPS_CR1,GPS_CG1,GPS_CB1},
+/* Plane C  Ω=120°  offset M= 60° */
+{26559750.0,0.0,55.0*DEG,120.0*DEG,0.0, 60.0*DEG,"GPS",GPS_CR2,GPS_CG2,GPS_CB2},
+{26559750.0,0.0,55.0*DEG,120.0*DEG,0.0,150.0*DEG,"GPS",GPS_CR2,GPS_CG2,GPS_CB2},
+{26559750.0,0.0,55.0*DEG,120.0*DEG,0.0,240.0*DEG,"GPS",GPS_CR2,GPS_CG2,GPS_CB2},
+{26559750.0,0.0,55.0*DEG,120.0*DEG,0.0,330.0*DEG,"GPS",GPS_CR2,GPS_CG2,GPS_CB2},
+/* Plane D  Ω=180°  offset M= 90° */
+{26559750.0,0.0,55.0*DEG,180.0*DEG,0.0, 90.0*DEG,"GPS",GPS_CR3,GPS_CG3,GPS_CB3},
+{26559750.0,0.0,55.0*DEG,180.0*DEG,0.0,180.0*DEG,"GPS",GPS_CR3,GPS_CG3,GPS_CB3},
+{26559750.0,0.0,55.0*DEG,180.0*DEG,0.0,270.0*DEG,"GPS",GPS_CR3,GPS_CG3,GPS_CB3},
+{26559750.0,0.0,55.0*DEG,180.0*DEG,0.0,  0.0*DEG,"GPS",GPS_CR3,GPS_CG3,GPS_CB3},
+/* Plane E  Ω=240°  offset M=120° */
+{26559750.0,0.0,55.0*DEG,240.0*DEG,0.0,120.0*DEG,"GPS",GPS_CR4,GPS_CG4,GPS_CB4},
+{26559750.0,0.0,55.0*DEG,240.0*DEG,0.0,210.0*DEG,"GPS",GPS_CR4,GPS_CG4,GPS_CB4},
+{26559750.0,0.0,55.0*DEG,240.0*DEG,0.0,300.0*DEG,"GPS",GPS_CR4,GPS_CG4,GPS_CB4},
+{26559750.0,0.0,55.0*DEG,240.0*DEG,0.0, 30.0*DEG,"GPS",GPS_CR4,GPS_CG4,GPS_CB4},
+/* Plane F  Ω=300°  offset M=150° */
+{26559750.0,0.0,55.0*DEG,300.0*DEG,0.0,150.0*DEG,"GPS",GPS_CR5,GPS_CG5,GPS_CB5},
+{26559750.0,0.0,55.0*DEG,300.0*DEG,0.0,240.0*DEG,"GPS",GPS_CR5,GPS_CG5,GPS_CB5},
+{26559750.0,0.0,55.0*DEG,300.0*DEG,0.0,330.0*DEG,"GPS",GPS_CR5,GPS_CG5,GPS_CB5},
+{26559750.0,0.0,55.0*DEG,300.0*DEG,0.0, 60.0*DEG,"GPS",GPS_CR5,GPS_CG5,GPS_CB5},
+};
+
+/* Lightweight struct for GPS — no trail/gt history needed */
+typedef struct { V3 pos, vel; const OrbEl *el; } GpsSat;
+static GpsSat gps_sats[GPS_N];
+
+static void gps_init(GpsSat *s, const OrbEl *el) {
+    s->el = el;
+    el_to_state(el, &s->pos, &s->vel);
+}
+
+static void gps_step(GpsSat *s, double dt, int use_j2) {
+    /* GPS circular orbit at 26 560 km — 1 sub-step always sufficient */
+    V3 a0 = gravity(s->pos, use_j2);
+    s->vel = v3add(s->vel, v3scl(a0, 0.5*dt));
+    s->pos = v3add(s->pos, v3scl(s->vel, dt));
+    V3 a1 = gravity(s->pos, use_j2);
+    s->vel = v3add(s->vel, v3scl(a1, 0.5*dt));
+}
+
+/* ======================================================================
+   Footprint circle — points on Earth's surface visible above elev_deg
+   ====================================================================== */
+#define FP_PTS 90   /* points on footprint circle */
+
+static void footprint_eci(V3 sat_pos, double elev_deg, V3 out[FP_PTS]) {
+    double h      = v3len(sat_pos) - RE;
+    double elev   = elev_deg * DEG;
+    double sin_eta = (RE / (RE + h)) * cos(elev);
+    if (sin_eta > 1.0) sin_eta = 1.0;
+    double eta    = asin(sin_eta);
+    double lambda = PI/2.0 - elev - eta;   /* Earth central half-angle */
+    if (lambda <= 0.0) { memset(out, 0, FP_PTS * sizeof(V3)); return; }
+
+    V3 ss = v3norm(sat_pos);   /* sub-satellite unit vector */
+
+    /* Orthonormal basis perpendicular to ss */
+    V3 ref = (fabs(ss.z) < 0.9) ? (V3){0,0,1} : (V3){1,0,0};
+    V3 e1  = v3norm(v3cross(ss, ref));
+    V3 e2  = v3cross(ss, e1);
+
+    for (int j = 0; j < FP_PTS; j++) {
+        double theta = j * (2.0*PI / FP_PTS);
+        V3 pt = v3add(v3scl(ss, cos(lambda)),
+                 v3add(v3scl(e1, sin(lambda)*cos(theta)),
+                       v3scl(e2, sin(lambda)*sin(theta))));
+        out[j] = v3scl(pt, RE);
+    }
+}
+
+/* Draw footprint circle on the 3D sphere */
+static void render_footprint_3d(SDL_Renderer *ren, V3 pos,
+                                  uint8_t cr, uint8_t cg, uint8_t cb,
+                                  double Rpx, double yaw, double pitch)
+{
+    V3 circle[FP_PTS];
+    footprint_eci(pos, 5.0, circle);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    for (int j = 0; j < FP_PTS; j++) {
+        V3 p0 = eci_to_view(circle[j],             yaw, pitch);
+        V3 p1 = eci_to_view(circle[(j+1)%FP_PTS],  yaw, pitch);
+        int occ0 = occluded(p0, Rpx);
+        int occ1 = occluded(p1, Rpx);
+        SDL_SetRenderDrawColor(ren, cr, cg, cb,
+                               (uint8_t)((occ0 || occ1) ? 25 : 160));
+        SDL_RenderDrawLine(ren, px_x(p0,Rpx), px_y(p0,Rpx),
+                                px_x(p1,Rpx), px_y(p1,Rpx));
+    }
+}
+
+/* Draw footprint circle on the Mercator map */
+static void render_footprint_map(SDL_Renderer *ren, V3 pos,
+                                   double earth_angle,
+                                   uint8_t cr, uint8_t cg, uint8_t cb)
+{
+    V3 circle[FP_PTS];
+    footprint_eci(pos, 5.0, circle);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    int prev_px=-1, prev_py=-1;
+    double prev_lon=0.0;
+    for (int j = 0; j <= FP_PTS; j++) {
+        V3 ef  = rz(v3norm(circle[j % FP_PTS]), -earth_angle);
+        double lat = asin(fmax(-1.0, fmin(1.0, ef.z)));
+        double lon = atan2(ef.y, ef.x);
+        int mpx = map_lon_to_px(lon);
+        int mpy = map_lat_to_py(lat);
+        if (prev_px >= 0) {
+            double dlon = fabs(lon - prev_lon);
+            if (dlon < PI) {
+                SDL_SetRenderDrawColor(ren, cr, cg, cb, 130);
+                SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+            }
+        }
+        prev_px=mpx; prev_py=mpy; prev_lon=lon;
+    }
+}
+
+/* Draw GPS constellation dots in 3D mode (small diamond markers) */
+static void render_gps_3d(SDL_Renderer *ren,
+                            double Rpx, double yaw, double pitch)
+{
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    for (int i = 0; i < GPS_N; i++) {
+        V3 sv = eci_to_view(gps_sats[i].pos, yaw, pitch);
+        if (occluded(sv, Rpx)) continue;
+        int sx = px_x(sv, Rpx), sy = px_y(sv, Rpx);
+        if (sx<3||sx>=WIN_W-3||sy<3||sy>=WIN_H-3) continue;
+        const OrbEl *e = gps_sats[i].el;
+        SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 210);
+        SDL_RenderDrawLine(ren, sx-3, sy,   sx,   sy-3);
+        SDL_RenderDrawLine(ren, sx,   sy-3, sx+3, sy  );
+        SDL_RenderDrawLine(ren, sx+3, sy,   sx,   sy+3);
+        SDL_RenderDrawLine(ren, sx,   sy+3, sx-3, sy  );
+    }
+}
+
+/* Draw GPS constellation dots in Mercator map mode */
+static void render_gps_map(SDL_Renderer *ren, double earth_angle)
+{
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    for (int i = 0; i < GPS_N; i++) {
+        V3 ef  = rz(v3norm(gps_sats[i].pos), -earth_angle);
+        double lat = asin(fmax(-1.0, fmin(1.0, ef.z)));
+        double lon = atan2(ef.y, ef.x);
+        int mpx = map_lon_to_px(lon);
+        int mpy = map_lat_to_py(lat);
+        if (mpx<3||mpx>=MAP_W-3||mpy<3||mpy>=WIN_H-3) continue;
+        const OrbEl *e = gps_sats[i].el;
+        SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 200);
+        SDL_Rect dot = {mpx-2, mpy-2, 5, 5};
+        SDL_RenderFillRect(ren, &dot);
+    }
+}
+
+/* ======================================================================
    Natural Earth precise line rendering into map_tex_buf
    ====================================================================== */
 
@@ -589,7 +787,8 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
                              const Sat sats[NUM_SATS],
                              double earth_angle,
                              double sim_time, int paused,
-                             int use_j2, int recording,
+                             int use_j2, int show_gps, int show_fp,
+                             int recording,
                              uint32_t frame_count)
 {
     /* Background map — blit only into the map area, not under the panel */
@@ -621,18 +820,25 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
             uint8_t alpha = (uint8_t)(25 + age * age * 200);
 
             if (prev_px >= 0) {
-                /* Antimeridian break: skip segment if longitude jump > 180° */
-                double dlon = fabs(lon - prev_lon);
-                if (dlon < PI) {
-                    SDL_SetRenderDrawColor(ren,
-                        (uint8_t)(s->el->cr * (0.4f + 0.6f*age)),
-                        (uint8_t)(s->el->cg * (0.4f + 0.6f*age)),
-                        (uint8_t)(s->el->cb * (0.4f + 0.6f*age)),
-                        alpha);
-                    SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+                /* Skip if this point is a re-enable sentinel */
+                if (s->gt_lat[idx] >= GT_BREAK - 1.0f) {
+                    prev_px = -1;   /* force a line break */
+                } else {
+                    /* Antimeridian break: skip segment if lon jump > 180° */
+                    double dlon = fabs(lon - prev_lon);
+                    if (dlon < PI) {
+                        SDL_SetRenderDrawColor(ren,
+                            (uint8_t)(s->el->cr * (0.4f + 0.6f*age)),
+                            (uint8_t)(s->el->cg * (0.4f + 0.6f*age)),
+                            (uint8_t)(s->el->cb * (0.4f + 0.6f*age)),
+                            alpha);
+                        SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+                    }
                 }
             }
-            prev_px=mpx; prev_py=mpy; prev_lon=lon;
+            /* Don't update prev if this was a sentinel */
+            if (s->gt_lat[idx] < GT_BREAK - 1.0f)
+                { prev_px=mpx; prev_py=mpy; prev_lon=lon; }
         }
     }
 
@@ -687,6 +893,21 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         draw_str(ren, lx,   ly,   e->name, e->cr, e->cg, e->cb, 1);
 
         SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    }
+
+    /* ── GPS constellation dots ────────────────────────────────────── */
+    if (show_gps) render_gps_map(ren, earth_angle);
+
+    /* ── Footprint circles ──────────────────────────────────────────── */
+    if (show_fp) {
+        for (int i=0; i<NUM_SATS; i++)
+            if (sats[i].visible)
+                render_footprint_map(ren, sats[i].pos, earth_angle,
+                                     sats[i].el->cr, sats[i].el->cg, sats[i].el->cb);
+        if (show_gps)
+            for (int i=0; i<GPS_N; i++)
+                render_footprint_map(ren, gps_sats[i].pos, earth_angle,
+                                     gps_sats[i].el->cr, gps_sats[i].el->cg, gps_sats[i].el->cb);
     }
 
     /* ── Lat/lon axis tick labels ──────────────────────────────────── */
@@ -777,10 +998,17 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
     SDL_RenderDrawLine(ren, WIN_W-196, legend_y+2, WIN_W-4, legend_y+2);
     legend_y += 8;
 
-    /* J2 and time_scale status */
+    /* J2 / GPS / FP status */
     draw_str(ren, WIN_W-196, legend_y,
              use_j2 ? "J2: ON " : "J2: OFF",
              use_j2?80:100, use_j2?200:100, use_j2?80:100, 1);
+    legend_y += 12;
+    draw_str(ren, WIN_W-196, legend_y,
+             show_gps ? "GPS: ON " : "GPS: OFF",
+             show_gps?80:100, show_gps?200:100, show_gps?80:100, 1);
+    draw_str(ren, WIN_W-130, legend_y,
+             show_fp ? "FP: ON " : "FP: OFF",
+             show_fp?80:100, show_fp?200:100, show_fp?80:100, 1);
 
     /* ── Bottom status bar ─────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 0,0,0, 190);
@@ -803,7 +1031,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
     }
 
     draw_str(ren, 10, WIN_H-54,
-             "+/- SPEED   SPC PAUSE   1-8 TOGGLE   J J2   P 3D VIEW   V VIDEO   Q QUIT",
+             "+/- SPEED   SPC PAUSE   1-8 TOGGLE   J J2   C GPS   F FOOTPRINT   P 3D VIEW   Q QUIT",
              55,90,65, 1);
 }
 
@@ -950,12 +1178,13 @@ static void render_hud(SDL_Renderer *ren,
                         const Sat sats[NUM_SATS],
                         double time_scale, double sim_time,
                         int paused, int use_j2,
-                        int show_gt, int recording,
+                        int show_gt, int show_gps, int show_fp,
+                        int recording,
                         uint32_t frame_count)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren,0,0,0,180);
-    SDL_Rect bg={WIN_W-200,10,190,NUM_SATS*26+72};
+    SDL_Rect bg={WIN_W-200,10,190,NUM_SATS*26+88};
     SDL_RenderFillRect(ren,&bg);
 
     draw_str(ren,WIN_W-196,14,"ORBITS",200,200,200,1);
@@ -977,6 +1206,11 @@ static void render_hud(SDL_Renderer *ren,
     draw_str(ren,WIN_W-172,ty, use_j2?"ON ":"OFF", use_j2?80:150, use_j2?210:150, use_j2?80:150,1);
     draw_str(ren,WIN_W-140,ty,"GT:",150,150,150,1);
     draw_str(ren,WIN_W-116,ty, show_gt?"ON ":"OFF", show_gt?80:150, show_gt?210:150, show_gt?80:150,1);
+    ty+=14;
+    draw_str(ren,WIN_W-196,ty,"GPS:",150,150,150,1);
+    draw_str(ren,WIN_W-166,ty, show_gps?"ON ":"OFF", show_gps?80:150, show_gps?210:150, show_gps?80:150,1);
+    draw_str(ren,WIN_W-134,ty,"FP:",150,150,150,1);
+    draw_str(ren,WIN_W-112,ty, show_fp?"ON ":"OFF", show_fp?80:150, show_fp?210:150, show_fp?80:150,1);
 
     char buf[160];
     double days=sim_time/86400.0, hours=fmod(sim_time,86400.0)/3600.0;
@@ -995,7 +1229,7 @@ static void render_hud(SDL_Renderer *ren,
     draw_str(ren,10,WIN_H-50,
              "+/- SPEED   R RESET   SPC PAUSE   1-8 TOGGLE   SCROLL ZOOM",85,85,85,1);
     draw_str(ren,10,WIN_H-38,
-             "J J2   G GROUND TRACK   P MAP VIEW   V VIDEO   Q/ESC QUIT",85,85,85,1);
+             "J J2   G GRND TRK   C GPS   F FOOTPRINT   P MAP   V VIDEO   Q QUIT",85,85,85,1);
 }
 
 /* ======================================================================
@@ -1073,6 +1307,7 @@ int main(void) {
 
     Sat sats[NUM_SATS];
     for (int i=0; i<NUM_SATS; i++) sat_init(&sats[i],&ORBITS[i]);
+    for (int i=0; i<GPS_N; i++)    gps_init(&gps_sats[i],&GPS_ORBITS[i]);
 
     double view_yaw   = 0.2;
     double view_pitch = 0.45;
@@ -1087,7 +1322,9 @@ int main(void) {
     int mx_prev=0, my_prev=0;
     int use_j2            = 0;
     int show_ground_track = 0;
-    int map_mode          = 0;   /* P toggle */
+    int map_mode          = 0;
+    int show_gps          = 0;   /* C toggle — full GPS constellation */
+    int show_fp           = 0;   /* F toggle — footprint circles */
     int recording         = 0;
     uint32_t frame_count  = 0;
 
@@ -1123,6 +1360,10 @@ int main(void) {
                 case SDLK_j:
                     use_j2=!use_j2;
                     printf("J2: %s\n",use_j2?"ON":"OFF"); break;
+                case SDLK_c:
+                    show_gps=!show_gps; break;
+                case SDLK_f:
+                    show_fp=!show_fp; break;
                 case SDLK_g:
                     if (!map_mode) show_ground_track=!show_ground_track;
                     break;
@@ -1133,7 +1374,22 @@ int main(void) {
                 case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
                 case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: {
                     int idx=ev.key.keysym.sym-SDLK_1;
-                    if (idx<NUM_SATS) sats[idx].visible^=1;
+                    if (idx<NUM_SATS) {
+                        sats[idx].visible ^= 1;
+                        if (sats[idx].visible) {
+                            /* Re-enabled: insert a break sentinel so the
+                               ground track renderer doesn't connect the old
+                               track to the new one with a straight line.   */
+                            Sat *s = &sats[idx];
+                            s->gt_lat[s->gt_head] = GT_BREAK;
+                            s->gt_lon[s->gt_head] = 0.0f;
+                            s->gt_head = (s->gt_head + 1) % GT_LEN;
+                            if (s->gt_cnt < GT_LEN) s->gt_cnt++;
+                            /* Also discard stale 3D trail positions */
+                            s->trail_cnt  = 0;
+                            s->trail_head = 0;
+                        }
+                    }
                     break; }
                 }
                 break;
@@ -1173,8 +1429,9 @@ int main(void) {
             int steps = 0;
             while (sim_acc >= DT_PHYS && steps < 600) {
                 for (int i=0; i<NUM_SATS; i++)
-                    if (sats[i].visible)
-                        sat_step(&sats[i], DT_PHYS, use_j2, earth_angle);
+                    sat_step(&sats[i], DT_PHYS, use_j2, earth_angle); /* always */
+                for (int i=0; i<GPS_N; i++)
+                    gps_step(&gps_sats[i], DT_PHYS, use_j2);          /* always */
                 earth_angle += OMEGA_E * DT_PHYS;
                 sim_time    += DT_PHYS;
                 sim_acc     -= DT_PHYS;
@@ -1194,7 +1451,7 @@ int main(void) {
             /* ── 2D Mercator map mode ─────────────────── */
             render_map_view(ren,map_tex,sats,
                             earth_angle,sim_time,paused,
-                            use_j2,recording,frame_count);
+                            use_j2,show_gps,show_fp,recording,frame_count);
         } else {
             /* ── 3D sphere mode ───────────────────────── */
             for (int i=0; i<N_STARS; i++) {
@@ -1217,12 +1474,28 @@ int main(void) {
             if (show_ground_track)
                 render_ground_tracks(ren,sats,Rpx,view_yaw,view_pitch,earth_angle);
 
+            /* Footprints drawn before satellite dots so dots sit on top */
+            if (show_fp) {
+                for (int i=0; i<NUM_SATS; i++)
+                    if (sats[i].visible)
+                        render_footprint_3d(ren, sats[i].pos,
+                                            sats[i].el->cr, sats[i].el->cg, sats[i].el->cb,
+                                            Rpx, view_yaw, view_pitch);
+                if (show_gps)
+                    for (int i=0; i<GPS_N; i++)
+                        render_footprint_3d(ren, gps_sats[i].pos,
+                                            gps_sats[i].el->cr, gps_sats[i].el->cg, gps_sats[i].el->cb,
+                                            Rpx, view_yaw, view_pitch);
+            }
+
+            if (show_gps) render_gps_3d(ren, Rpx, view_yaw, view_pitch);
+
             for (int i=0; i<NUM_SATS; i++)
                 if (sats[i].visible)
                     render_satellite(ren,&sats[i],Rpx,view_yaw,view_pitch);
 
             render_hud(ren,sats,time_scale,sim_time,
-                       paused,use_j2,show_ground_track,recording,frame_count);
+                       paused,use_j2,show_ground_track,show_gps,show_fp,recording,frame_count);
         }
 
         if (recording) video_frame(ren);
