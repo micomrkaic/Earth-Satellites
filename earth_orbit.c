@@ -392,12 +392,28 @@ static V3 gravity(V3 pos, int use_j2) {
 }
 
 static void sat_step(Sat *s, double dt, int use_j2, double earth_angle) {
-    /* Velocity Verlet */
-    V3 a0=gravity(s->pos,use_j2);
-    s->vel=v3add(s->vel,v3scl(a0,0.5*dt));
-    s->pos=v3add(s->pos,v3scl(s->vel,dt));
-    V3 a1=gravity(s->pos,use_j2);
-    s->vel=v3add(s->vel,v3scl(a1,0.5*dt));
+    /* Adaptive sub-stepping: near perigee of highly eccentric orbits
+       (e.g. Molniya, perigee ~535 km) the satellite moves ~10 km/s and the
+       force changes ~5.8 % per 20 s step — too large for energy conservation.
+       Sub-divide so each sub-step covers < 1 % force change.
+         alt < 1000 km → 8 sub-steps of 2.5 s  (force Δ ≈ 0.7 %)
+         alt < 4000 km → 4 sub-steps of 5 s     (force Δ ≈ 1.4 %)
+         alt <10000 km → 2 sub-steps of 10 s
+         otherwise    → 1 sub-step  of 20 s                              */
+    double r   = v3len(s->pos);
+    double alt = r - RE;
+    int    ns  = (alt < 1000e3) ? 8 :
+                 (alt < 4000e3) ? 4 :
+                 (alt <10000e3) ? 2 : 1;
+    double sub = dt / ns;
+
+    for (int k = 0; k < ns; k++) {
+        V3 a0  = gravity(s->pos, use_j2);
+        s->vel = v3add(s->vel, v3scl(a0, 0.5*sub));
+        s->pos = v3add(s->pos, v3scl(s->vel, sub));
+        V3 a1  = gravity(s->pos, use_j2);
+        s->vel = v3add(s->vel, v3scl(a1, 0.5*sub));
+    }
 
     if (++s->trail_ctr >= TRAIL_STEP) {
         s->trail_ctr=0;
@@ -1087,7 +1103,15 @@ int main(void) {
             case SDL_KEYDOWN:
                 switch (ev.key.keysym.sym) {
                 case SDLK_ESCAPE: case SDLK_q: running=0; break;
-                case SDLK_SPACE:  paused=!paused; break;
+                case SDLK_SPACE:
+                    paused = !paused;
+                    if (!paused) {
+                        /* Discard any accumulated backlog so the simulation
+                           resumes smoothly rather than jumping forward.      */
+                        sim_acc = 0.0;
+                        t_prev  = SDL_GetTicks();
+                    }
+                    break;
                 case SDLK_p:      map_mode=!map_mode; break;
                 case SDLK_r:
                     if (!map_mode) { view_yaw=0.2;view_pitch=0.45;zoom=ZOOM_INIT; }
@@ -1145,17 +1169,21 @@ int main(void) {
         t_prev=t_now;
 
         if (!paused) {
-            sim_acc+=time_scale*dt_real;
-            int steps=0;
-            while (sim_acc>=DT_PHYS && steps<600) {
+            sim_acc += time_scale * dt_real;
+            int steps = 0;
+            while (sim_acc >= DT_PHYS && steps < 600) {
                 for (int i=0; i<NUM_SATS; i++)
                     if (sats[i].visible)
-                        sat_step(&sats[i],DT_PHYS,use_j2,earth_angle);
-                earth_angle+=OMEGA_E*DT_PHYS;
-                sim_time   +=DT_PHYS;
-                sim_acc    -=DT_PHYS;
+                        sat_step(&sats[i], DT_PHYS, use_j2, earth_angle);
+                earth_angle += OMEGA_E * DT_PHYS;
+                sim_time    += DT_PHYS;
+                sim_acc     -= DT_PHYS;
                 steps++;
             }
+            /* If physics is capped (time_scale too high to keep up),
+               discard the excess rather than letting the backlog grow.
+               Without this, resuming from pause would cause a large jump. */
+            if (sim_acc > DT_PHYS) sim_acc = 0.0;
         }
 
         /* ── Render ───────────────────────────────────── */
