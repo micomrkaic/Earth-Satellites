@@ -441,11 +441,11 @@ static void build_stars(void) {
 static const OrbEl ORBITS[NUM_SATS] = {
     { 42164000.0,0.000, 0.0*DEG,  0.0*DEG,  0.0*DEG,  0.0*DEG,"GEO",     0,  255,255},
     { 42164000.0,0.000,28.0*DEG, 45.0*DEG,  0.0*DEG,120.0*DEG,"GEOSYNC",255,255,255},
-    { 26560000.0,0.740,63.4*DEG,  0.0*DEG,270.0*DEG,180.0*DEG,"MOLNIYA",255, 50, 50},
+    { 26560000.0,0.740,63.4*DEG, 40.0*DEG,270.0*DEG,180.0*DEG,"MOLNIYA",255, 50, 50},
     {  6778000.0,0.000,51.6*DEG, 45.0*DEG,  0.0*DEG, 90.0*DEG,"ISS",    255,255,  0},
     {  7000000.0,0.000,90.0*DEG, 90.0*DEG,  0.0*DEG,  0.0*DEG,"POLAR",   50,255, 50},
-    { 26560000.0,0.010,55.0*DEG,160.0*DEG,  0.0*DEG,240.0*DEG,"MEO/GPS",255, 50,255},
-    { 42164000.0,0.270,63.4*DEG,  0.0*DEG,270.0*DEG,270.0*DEG,"TUNDRA", 255,165,  0},
+    { 26560000.0,0.000,55.0*DEG,160.0*DEG,  0.0*DEG,240.0*DEG,"MEO/GPS",255, 50,255},
+    { 42164000.0,0.270,63.4*DEG,180.0*DEG,270.0*DEG,270.0*DEG,"TUNDRA", 255,165,  0},
     {  7178000.0,0.000,98.7*DEG,130.0*DEG,  0.0*DEG,180.0*DEG,"SSO",    255,150,200},
 };
 
@@ -522,78 +522,32 @@ static int map_lat_to_py(double lat) {
 
 static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
     /* Colour palette — NASA MCC dark theme */
-    const uint32_t C_OCEAN    = 0xFF06101E;   /* deep navy */
-    const uint32_t C_OCEAN_SH = 0xFF0A1828;   /* slightly lighter near coast */
-    const uint32_t C_LAND     = 0xFF142B10;   /* dark forest green */
-    const uint32_t C_COAST    = 0xFF3A7832;   /* bright coastline */
-    const uint32_t C_ICE      = 0xFFB8C8D8;   /* polar ice */
-    const uint32_t C_GRID     = 0xFF111E30;   /* dim grid */
-    const uint32_t C_GRID_EQ  = 0xFF1A3050;   /* equator / prime meridian */
+    /* Uniform dark ocean background with lat/lon grid only.
+       Actual geography is drawn by the Natural Earth line pass below.   */
+    const uint32_t C_OCEAN   = 0xFF06101E;   /* deep navy                */
+    const uint32_t C_GRID    = 0xFF0E1C30;   /* dim 30° grid             */
+    const uint32_t C_GRID_EQ = 0xFF162840;   /* equator / prime meridian */
 
-    for (int py=0; py<WIN_H; py++) {
-        /* Inverse Mercator for this row (and row+1 for neighbour check) */
-        double ym   = g_map_y_max*(1.0 - 2.0*py/(double)WIN_H);
-        double lat  = 2.0*atan(exp(ym)) - PI/2.0;
-        double ym1  = g_map_y_max*(1.0 - 2.0*(py+1)/(double)WIN_H);
-        double latn = (py+1<WIN_H) ? 2.0*atan(exp(ym1))-PI/2.0 : lat;
+    for (int py = 0; py < WIN_H; py++) {
+        double ym      = g_map_y_max * (1.0 - 2.0*py / (double)WIN_H);
+        double lat     = 2.0*atan(exp(ym)) - PI/2.0;
+        double lat_deg = lat * (180.0/PI);
+        double la30    = fmod(fabs(lat_deg), 30.0);
 
-        double lat_deg = lat*(180.0/PI);
+        for (int px = 0; px < MAP_W; px++) {
+            double lon   = ((double)px / (double)MAP_W) * 2.0*PI - PI;
+            double lo_d  = lon * (180.0/PI);
+            double lo30  = fmod(lo_d < 0 ? lo_d + 360.0 : lo_d, 30.0);
 
-        for (int px=0; px<MAP_W; px++) {
-            double lon  = ((double)px /(double)MAP_W)*2.0*PI - PI;
-            double lone = ((double)(px+1)/(double)MAP_W)*2.0*PI - PI;
+            int on_eq   = fabs(lat_deg) < 0.28;
+            int on_pm   = fabs(lo_d)    < 0.20;
+            int on_grid = (la30 < 0.50) || (lo30 < 0.25);
 
-            int land     = lm_lookup(lat,  lon);
-            int land_e   = lm_lookup(lat,  lone);
-            int land_s   = lm_lookup(latn, lon);
-            int is_coast = land && (!land_e || !land_s);
-            int is_shore = !land && (land_e || land_s);  /* ocean next to land */
+            uint32_t col = C_OCEAN;
+            if      (on_eq || on_pm) col = C_GRID_EQ;
+            else if (on_grid)        col = C_GRID;
 
-            /* Latitude / longitude grid lines */
-            double la30 = fmod(fabs(lat_deg), 30.0);
-            double lo_d = lon*(180.0/PI);
-            double lo_d_pos = lo_d < 0 ? lo_d+360.0 : lo_d;
-            double lo30 = fmod(lo_d_pos, 30.0);
-            int on_eq   = fabs(lat_deg) < 0.25;
-            int on_pm   = fabs(lo_d) < 0.18;
-            int on_grid = (la30 < 0.45) || (lo30 < 0.22);
-
-            uint32_t col;
-            if (is_coast) {
-                col = C_COAST;
-            } else if (land) {
-                /* Polar ice: Antarctica and Arctic edges */
-                double al = fabs(lat_deg);
-                if (al > 75.0) {
-                    double f = fmin(1.0, (al-75.0)/7.0);
-                    /* blend land → ice */
-                    uint8_t lr = (C_LAND>>16)&0xFF, lg=(C_LAND>>8)&0xFF, lb=C_LAND&0xFF;
-                    uint8_t ir = (C_ICE>>16)&0xFF,  ig=(C_ICE>>8)&0xFF,  ib=C_ICE&0xFF;
-                    uint8_t R=(uint8_t)(lr+f*(ir-lr)), G=(uint8_t)(lg+f*(ig-lg)), B=(uint8_t)(lb+f*(ib-lb));
-                    col = 0xFF000000|((uint32_t)R<<16)|((uint32_t)G<<8)|B;
-                } else {
-                    col = C_LAND;
-                }
-            } else {
-                /* Ocean */
-                if (is_shore) col = C_OCEAN_SH;
-                else          col = C_OCEAN;
-            }
-
-            /* Grid overlay (only on ocean / non-coast) */
-            if (!is_coast && !land) {
-                if (on_eq || on_pm)  col = C_GRID_EQ;
-                else if (on_grid)    col = C_GRID;
-            } else if (land && !is_coast) {
-                /* Subtle grid on land too */
-                if (on_grid) {
-                    uint8_t R=(col>>16)&0xFF, G=(col>>8)&0xFF, B=col&0xFF;
-                    R=(uint8_t)(R*0.78); G=(uint8_t)(G*0.78); B=(uint8_t)(B*0.78);
-                    col = 0xFF000000|((uint32_t)R<<16)|((uint32_t)G<<8)|B;
-                }
-            }
-
-            map_tex_buf[py*WIN_W + px] = col;
+            map_tex_buf[py * WIN_W + px] = col;
         }
     }
 
