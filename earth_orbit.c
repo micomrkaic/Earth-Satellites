@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include "map_data.h"   /* Natural Earth 1:50m coastlines + borders (gen_map_data.py) */
 
 /* ======================================================================
    Constants
@@ -52,8 +53,9 @@
    Enough for ≥1 full orbit of every satellite type. */
 #define GT_LEN   1500
 
-/* Mercator map clipped to ±82° latitude */
+/* Mercator map clipped to ±82° latitude, right edge leaves room for panel */
 #define MAP_LAT_CLIP (82.0 * DEG)
+#define MAP_W        (WIN_W - 200)   /* map viewport width, panel sits right of this */
 
 /* ======================================================================
    5×7 bitmap font
@@ -448,13 +450,68 @@ static const OrbEl ORBITS[NUM_SATS] = {
 };
 
 /* ======================================================================
+   Natural Earth precise line rendering into map_tex_buf
+   ====================================================================== */
+
+/* These are needed by both the NE helpers and build_mercator_texture */
+static double   g_map_y_max;                    /* log(tan(π/4 + clip/2)) */
+static uint32_t map_tex_buf[WIN_H * WIN_W];     /* 3.7 MB in BSS          */
+
+/* Degrees → pixel (uses g_map_y_max, set before build_mercator_texture) */
+static int ne_lx(double lon_d) {
+    return (int)((lon_d + 180.0) / 360.0 * MAP_W);
+}
+static int ne_ly(double lat_d) {
+    if (lat_d >  82.0) lat_d =  82.0;
+    if (lat_d < -82.0) lat_d = -82.0;
+    double lr = lat_d * (PI/180.0);
+    double y  = log(tan(PI/4.0 + lr/2.0));
+    return (int)((g_map_y_max - y) / (2.0*g_map_y_max) * WIN_H);
+}
+
+/* Bresenham line into map_tex_buf (texture stride = WIN_W) */
+static void buf_line(int x0, int y0, int x1, int y1, uint32_t col) {
+    int dx = abs(x1-x0), dy = abs(y1-y0);
+    int sx = x0<x1 ? 1 : -1, sy = y0<y1 ? 1 : -1;
+    int err = dx-dy, imax = dx+dy+2;
+    for (int i=0; i<imax; i++) {
+        if (x0>=0 && x0<MAP_W && y0>=0 && y0<WIN_H)
+            map_tex_buf[y0*WIN_W + x0] = col;
+        if (x0==x1 && y0==y1) break;
+        int e2=err*2;
+        if (e2>-dy) { err-=dy; x0+=sx; }
+        if (e2< dx) { err+=dx; y0+=sy; }
+    }
+}
+
+/* Draw a Natural Earth polyline dataset into the texture buffer.
+   thick=1 draws a second row offset +1 in y for 2-pixel coastlines. */
+static void draw_ne_lines(const float pts[][2],
+                           const int *starts, const int *lens, int npolys,
+                           uint32_t col, int thick)
+{
+    for (int i=0; i<npolys; i++) {
+        const float (*line)[2] = pts + starts[i];
+        int n = lens[i];
+        for (int j=1; j<n; j++) {
+            double lon0=line[j-1][0], lat0=line[j-1][1];
+            double lon1=line[j][0],   lat1=line[j][1];
+            if (fabs(lon1-lon0) > 180.0) continue;   /* antimeridian break */
+            int x0=ne_lx(lon0), y0=ne_ly(lat0);
+            int x1=ne_lx(lon1), y1=ne_ly(lat1);
+            buf_line(x0, y0,   x1, y1,   col);
+            if (thick) buf_line(x0, y0+1, x1, y1+1, col);
+        }
+    }
+}
+
+/* ======================================================================
    Mercator map background texture
    ====================================================================== */
-static double g_map_y_max;   /* = log(tan(PI/4 + MAP_LAT_CLIP/2)) */
 
-/* Map-space projections */
+/* Map-space projections (radians input — used by render_map_view overlays) */
 static int map_lon_to_px(double lon) {
-    return (int)((lon + PI) / (2.0*PI) * WIN_W);
+    return (int)((lon + PI) / (2.0*PI) * MAP_W);
 }
 static int map_lat_to_py(double lat) {
     if (lat >  MAP_LAT_CLIP) lat =  MAP_LAT_CLIP;
@@ -462,9 +519,6 @@ static int map_lat_to_py(double lat) {
     double y = log(tan(PI/4.0 + lat/2.0));
     return (int)((g_map_y_max - y) / (2.0*g_map_y_max) * WIN_H);
 }
-
-/* Large pixel buffer lives in BSS — 3.7 MB */
-static uint32_t map_tex_buf[WIN_H * WIN_W];
 
 static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
     /* Colour palette — NASA MCC dark theme */
@@ -485,9 +539,9 @@ static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
 
         double lat_deg = lat*(180.0/PI);
 
-        for (int px=0; px<WIN_W; px++) {
-            double lon  = ((double)px /(double)WIN_W)*2.0*PI - PI;
-            double lone = ((double)(px+1)/(double)WIN_W)*2.0*PI - PI;
+        for (int px=0; px<MAP_W; px++) {
+            double lon  = ((double)px /(double)MAP_W)*2.0*PI - PI;
+            double lone = ((double)(px+1)/(double)MAP_W)*2.0*PI - PI;
 
             int land     = lm_lookup(lat,  lon);
             int land_e   = lm_lookup(lat,  lone);
@@ -543,6 +597,14 @@ static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
         }
     }
 
+    /* ── Overlay precise Natural Earth coastlines + country borders ── */
+    /* Country borders first (dimmer, underneath coastlines) */
+    draw_ne_lines(border_pts, border_start, border_len, BORDER_NPOLYS,
+                  0xFF2A6835, 0);   /* dim green, 1 px */
+    /* Coastlines on top — 2 px wide, brighter green */
+    draw_ne_lines(coast_pts,  coast_start,  coast_len,  COAST_NPOLYS,
+                  0xFF55D060, 1);   /* bright green, 2 px */
+
     SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                                           SDL_TEXTUREACCESS_STATIC, WIN_W, WIN_H);
     if (!tex) return NULL;
@@ -560,8 +622,10 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
                              int use_j2, int recording,
                              uint32_t frame_count)
 {
-    /* Background map */
-    SDL_RenderCopy(ren, map_tex, NULL, NULL);
+    /* Background map — blit only into the map area, not under the panel */
+    SDL_Rect map_dest = {0, 0, MAP_W, WIN_H};
+    SDL_Rect map_src  = {0, 0, MAP_W, WIN_H};
+    SDL_RenderCopy(ren, map_tex, &map_src, &map_dest);
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
@@ -615,7 +679,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         int mpx = map_lon_to_px(lon);
         int mpy = map_lat_to_py(lat);
 
-        if (mpx<5 || mpx>=WIN_W-5 || mpy<5 || mpy>=WIN_H-5) continue;
+        if (mpx<5 || mpx>=MAP_W-5 || mpy<5 || mpy>=WIN_H-5) continue;
 
         const OrbEl *e = s->el;
 
@@ -669,7 +733,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         }
         /* tick line */
         SDL_SetRenderDrawColor(ren, 50,80,60, 200);
-        SDL_RenderDrawLine(ren, 0, py, WIN_W-200, py);
+        SDL_RenderDrawLine(ren, 0, py, MAP_W, py);
         draw_str(ren, 3, py-4, buf, 70,110,70, 1);
     }
     /* Longitude labels on bottom edge */
@@ -677,7 +741,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
     for (int t=0; t<12; t++) {
         double lon_r = lon_ticks[t]*DEG;
         int ppx = map_lon_to_px(lon_r);
-        if (ppx < 0 || ppx >= WIN_W-200) continue;
+        if (ppx < 0 || ppx >= MAP_W) continue;
         char buf[8]; snprintf(buf,sizeof(buf),"%d",lon_ticks[t]);
         SDL_SetRenderDrawColor(ren, 50,80,60, 200);
         SDL_RenderDrawLine(ren, ppx, 0, ppx, WIN_H-28);
@@ -687,7 +751,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
     /* ── Title bar ─────────────────────────────────────────────────── */
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ren, 0,0,0, 180);
-    SDL_Rect tbar = {0, 0, WIN_W-200, 16};
+    SDL_Rect tbar = {0, 0, MAP_W, 16};
     SDL_RenderFillRect(ren, &tbar);
     draw_str(ren, 6, 4, "GROUND TRACK MONITOR  MERCATOR PROJECTION", 60,160,80, 1);
 
@@ -750,7 +814,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
 
     /* ── Bottom status bar ─────────────────────────────────────────── */
     SDL_SetRenderDrawColor(ren, 0,0,0, 190);
-    SDL_Rect bot = {0, WIN_H-28, WIN_W-200, 28};
+    SDL_Rect bot = {0, WIN_H-28, MAP_W, 28};
     SDL_RenderFillRect(ren, &bot);
 
     double days  = sim_time/86400.0;
@@ -1030,7 +1094,7 @@ int main(void) {
     /* Mercator y-range */
     g_map_y_max = log(tan(PI/4.0 + MAP_LAT_CLIP/2.0));
 
-    printf("Building Mercator map texture..."); fflush(stdout);
+    printf("Building Mercator map texture (Natural Earth 1:50m)..."); fflush(stdout);
     SDL_Texture *map_tex = build_mercator_texture(ren);
     if (!map_tex) { fprintf(stderr,"build_mercator_texture failed\n"); return 1; }
     printf(" done\n");
