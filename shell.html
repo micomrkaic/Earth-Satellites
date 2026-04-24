@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Earth Satellite Orbit Simulation</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #000; font-family: monospace;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      min-height: 100vh; padding: 8px;
+    }
+    #canvas-container { position: relative; width: 100%; max-width: 1200px; }
+    canvas {
+      display: block; width: 100%; height: auto;
+      image-rendering: pixelated; image-rendering: crisp-edges;
+      border: 1px solid #111;
+    }
+    #loading {
+      position: absolute; inset: 0; background: #000;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px;
+    }
+    #loading-title { color: #4af; font-size: 15px; letter-spacing: 0.15em; }
+    #progress-bar-outer { width: 260px; height: 8px; background: #111; border: 1px solid #2a4a2a; }
+    #progress-bar-inner { height: 100%; width: 0%; background: #3d8; transition: width 0.15s ease; }
+    #status { color: #567; font-size: 11px; }
+    #hint { margin-top: 6px; font-size: 11px; color: #334; letter-spacing: 0.04em; text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container">
+    <canvas id="canvas" tabindex="0" width="1200" height="780"
+            oncontextmenu="event.preventDefault()"></canvas>
+    <div id="loading">
+      <div id="loading-title">EARTH SATELLITE ORBIT SIMULATION</div>
+      <div id="progress-bar-outer"><div id="progress-bar-inner"></div></div>
+      <div id="status">Initialising…</div>
+    </div>
+  </div>
+  <div id="hint">
+    1-8 satellites &middot; P map &middot; Space pause &middot;
+    +/- speed &middot; J J2 &middot; C GPS &middot; F footprint &middot; R reset
+  </div>
+
+  <script>
+    /* ── Key map: physical key code → SDL keycode ──────────────────────
+       C polls window._wk each frame via EM_ASM_INT.  No C function call
+       from JS required — eliminates all export/scope issues entirely.   */
+    var KEY_MAP = {
+      'Space':32,'Escape':27,'Equal':61,'Minus':45,
+      'KeyQ':113,'KeyR':114,'KeyJ':106,'KeyG':103,
+      'KeyP':112,'KeyC':99,'KeyF':102,'KeyV':118,
+      'Digit1':49,'Digit2':50,'Digit3':51,'Digit4':52,
+      'Digit5':53,'Digit6':54,'Digit7':55,'Digit8':56
+    };
+
+    /* Capture phase on window — fires regardless of which element has
+       DOM focus, regardless of iframe sandboxing.                      */
+    window.addEventListener('keydown', function(e) {
+      var sym = KEY_MAP[e.code];
+      if (sym !== undefined) {
+        window._wk = sym;     /* C reads this via EM_ASM_INT each frame */
+        e.preventDefault();
+      }
+    }, true);
+
+    /* Also keep canvas focused for SDL2's own mouse/scroll handling    */
+    var canvas = document.getElementById('canvas');
+    canvas.addEventListener('mousedown', function() { canvas.focus(); });
+    window.addEventListener('resize', function() { canvas.focus(); });
+
+    var loadingDiv  = document.getElementById('loading');
+    var progressBar = document.getElementById('progress-bar-inner');
+    var statusEl    = document.getElementById('status');
+
+    var Module = {
+      canvas: canvas,
+      setStatus: function(text) {
+        if (!text) return;
+        var m = text.match(/\((\d+)\/(\d+)\)/);
+        if (m) {
+          var pct = (parseInt(m[1]) / parseInt(m[2]) * 100).toFixed(0);
+          progressBar.style.width = pct + '%';
+          statusEl.textContent = 'Loading… ' + pct + '%';
+        } else { statusEl.textContent = text; }
+      },
+      onRuntimeInitialized: function() {
+        progressBar.style.width = '100%';
+        statusEl.textContent = 'Ready';
+        setTimeout(function() {
+          loadingDiv.parentNode.removeChild(loadingDiv);
+          canvas.focus();
+        }, 500);
+      },
+      preRun: [], postRun: [],
+      INITIAL_MEMORY: 67108864,
+      print:    function(t) { console.log(t); },
+      printErr: function(t) { console.warn(t); },
+    };
+  </script>
+
+  {{{ SCRIPT }}}
+</body>
+</html>

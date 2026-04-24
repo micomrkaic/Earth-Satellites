@@ -24,6 +24,10 @@
 #include <time.h>
 #include "map_data.h"   /* Natural Earth 1:50m coastlines + borders (gen_map_data.py) */
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 /* ======================================================================
    Constants
    ====================================================================== */
@@ -670,6 +674,10 @@ static void render_gps_map(SDL_Renderer *ren, double earth_angle)
 /* These are needed by both the NE helpers and build_mercator_texture */
 static double   g_map_y_max;                    /* log(tan(π/4 + clip/2)) */
 static uint32_t map_tex_buf[WIN_H * WIN_W];     /* 3.7 MB in BSS          */
+#ifdef __EMSCRIPTEN__
+static int g_wasm_key_count = 0;  /* increments each time a JS key is polled */
+static int g_wasm_last_key  = -1; /* last SDL keycode received from JS */
+#endif
 
 /* Degrees → pixel (uses g_map_y_max, set before build_mercator_texture) */
 static int ne_lx(double lon_d) {
@@ -1220,6 +1228,14 @@ static void render_hud(SDL_Renderer *ren,
     draw_str(ren,160,WIN_H-22,buf,180,180,220,1);
 
     if (paused) draw_str(ren,420,WIN_H-22,"PAUSED",255,200,50,2);
+#ifdef __EMSCRIPTEN__
+    {
+        char kbuf[40];
+        snprintf(kbuf,sizeof(kbuf),"JS-KEY CNT=%d LAST=%d",
+                 g_wasm_key_count, g_wasm_last_key);
+        draw_str(ren,10,WIN_H-64,kbuf,200,100,100,1);
+    }
+#endif
 
     if (recording) {
         int blink=(frame_count/30)&1;
@@ -1233,8 +1249,10 @@ static void render_hud(SDL_Renderer *ren,
 }
 
 /* ======================================================================
-   ffmpeg video capture
+   ffmpeg video capture  (desktop only — not available in WASM builds)
    ====================================================================== */
+#ifndef __EMSCRIPTEN__
+
 static FILE   *ffmpeg_pipe = NULL;
 static uint8_t frame_buf[WIN_W * WIN_H * 4];
 
@@ -1267,247 +1285,345 @@ static void video_frame(SDL_Renderer *ren) {
     fwrite(frame_buf,(size_t)WIN_W*WIN_H*3,1,ffmpeg_pipe);
 }
 
+#else /* __EMSCRIPTEN__ — video capture not available in browser */
+
+static int  video_start(void)              { return 0; }
+static void video_stop(void)               {}
+static void video_frame(SDL_Renderer *ren) { (void)ren; }
+
+#endif /* __EMSCRIPTEN__ */
+
+/* ======================================================================
+   Main loop state — lifted to file scope so main_loop() can access it.
+   In the desktop build this is equivalent to having locals in main();
+   in the WASM build emscripten_set_main_loop() calls main_loop() each
+   frame from the browser's requestAnimationFrame callback, so every
+   variable that persists across frames must live here.
+   ====================================================================== */
+static SDL_Renderer *g_ren       = NULL;
+static SDL_Texture  *g_earth_tex = NULL;
+static SDL_Texture  *g_map_tex   = NULL;
+static Sat           g_sats[NUM_SATS];
+
+static double   g_view_yaw    = 0.2;
+static double   g_view_pitch  = 0.45;
+static double   g_zoom        = ZOOM_INIT;
+static double   g_earth_angle = 0.0;
+static double   g_sim_time    = 0.0;
+static double   g_sim_acc     = 0.0;
+static double   g_time_scale  = 800.0;
+
+static int      g_paused       = 0;
+static int      g_dragging     = 0;
+static int      g_mx_prev      = 0;
+static int      g_my_prev      = 0;
+static int      g_use_j2       = 0;
+static int      g_show_gt      = 0;
+static int      g_map_mode     = 0;
+static int      g_show_gps     = 0;
+static int      g_show_fp      = 0;
+static int      g_recording    = 0;
+static uint32_t g_frame_count  = 0;
+static uint32_t g_t_prev       = 0;
+static int      g_running      = 1;
+
+/* ======================================================================
+   WASM keyboard — polls a JS global variable set by shell.html.
+   Avoids ALL C/JS function-call boundary issues:
+     - No exported C functions called from JS
+     - No EM_JS object-literal brace problems
+     - No SDL2 focus detection (which is broken in newer Emscripten)
+   Shell.html sets window._wk to an SDL keycode integer when a key is
+   pressed.  C reads it each frame with EM_ASM_INT (ternary, no braces)
+   and clears it.  process_key() handles the rest.
+   ====================================================================== */
+#ifdef __EMSCRIPTEN__
+static int wasm_poll_key(void)
+{
+    int k = EM_ASM_INT(
+        var k = (window._wk !== undefined) ? window._wk : -1;
+        window._wk = undefined;
+        return k
+    );
+    if (k >= 0) { g_wasm_key_count++; g_wasm_last_key = k; }
+    return k;
+}
+#endif
+
+/* ======================================================================
+   Key handler — shared between SDL event path (native + WASM SDL events)
+   and the WASM pending-key path.
+   ====================================================================== */
+static void process_key(SDL_Keycode sym)
+{
+    switch (sym) {
+    case SDLK_ESCAPE: case SDLK_q:
+        g_running = 0;
+#ifdef __EMSCRIPTEN__
+        emscripten_cancel_main_loop();
+#endif
+        break;
+    case SDLK_SPACE:
+        g_paused = !g_paused;
+        if (!g_paused) {
+            g_sim_acc = 0.0;
+            g_t_prev  = SDL_GetTicks();
+        }
+        break;
+    case SDLK_p:      g_map_mode = !g_map_mode; break;
+    case SDLK_r:
+        if (!g_map_mode) { g_view_yaw=0.2; g_view_pitch=0.45; g_zoom=ZOOM_INIT; }
+        break;
+    case SDLK_EQUALS: case SDLK_PLUS:
+        g_time_scale = fmin(g_time_scale*2.0, 1e6); break;
+    case SDLK_MINUS:
+        g_time_scale = fmax(g_time_scale/2.0, 1.0); break;
+    case SDLK_j:
+        g_use_j2 = !g_use_j2;
+        printf("J2: %s\n", g_use_j2 ? "ON" : "OFF"); break;
+    case SDLK_c:  g_show_gps = !g_show_gps; break;
+    case SDLK_f:  g_show_fp  = !g_show_fp;  break;
+    case SDLK_g:
+        if (!g_map_mode) g_show_gt = !g_show_gt;
+        break;
+    case SDLK_v:
+#ifndef __EMSCRIPTEN__
+        if (!g_recording) { if (video_start()) g_recording=1; }
+        else              { video_stop(); g_recording=0; }
+#endif
+        break;
+    case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
+    case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: {
+        int idx = sym - SDLK_1;
+        if (idx < NUM_SATS) {
+            g_sats[idx].visible ^= 1;
+            if (g_sats[idx].visible) {
+                Sat *s = &g_sats[idx];
+                s->gt_lat[s->gt_head] = GT_BREAK;
+                s->gt_lon[s->gt_head] = 0.0f;
+                s->gt_head = (s->gt_head + 1) % GT_LEN;
+                if (s->gt_cnt < GT_LEN) s->gt_cnt++;
+                s->trail_cnt  = 0;
+                s->trail_head = 0;
+            }
+        }
+        break; }
+    default: break;
+    }
+}
+
+/* ======================================================================
+   Per-frame callback — called from the while loop (desktop) or from
+   emscripten_set_main_loop (WASM).
+   ====================================================================== */
+static void main_loop(void)
+{
+    SDL_Event ev;
+
+    /* ── WASM keyboard poll ─────────────────────────── */
+#ifdef __EMSCRIPTEN__
+    {
+        int _wk = wasm_poll_key();
+        if (_wk >= 0) process_key((SDL_Keycode)_wk);
+    }
+#endif
+
+    /* ── Events ─────────────────────────────────────── */
+    while (SDL_PollEvent(&ev)) {
+        switch (ev.type) {
+        case SDL_QUIT:
+            g_running = 0;
+#ifdef __EMSCRIPTEN__
+            emscripten_cancel_main_loop();
+#endif
+            break;
+        case SDL_KEYDOWN:
+#ifndef __EMSCRIPTEN__
+            /* In WASM, keys are handled by wasm_poll_key() above.
+               SDL also delivers them here, causing double-toggles.
+               Disable this path so each keypress is processed once. */
+            process_key(ev.key.keysym.sym);
+#endif
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            if (!g_map_mode && ev.button.button==SDL_BUTTON_LEFT) {
+                g_dragging=1; g_mx_prev=ev.button.x; g_my_prev=ev.button.y;
+            }
+            break;
+        case SDL_MOUSEBUTTONUP:
+            if (ev.button.button==SDL_BUTTON_LEFT) g_dragging=0;
+            break;
+        case SDL_MOUSEMOTION:
+            if (!g_map_mode && g_dragging) {
+                g_view_yaw   += (ev.motion.x - g_mx_prev)*0.006;
+                g_view_pitch += (ev.motion.y - g_my_prev)*0.006;
+                g_view_pitch  = fmax(-PI/2.0+0.05, fmin(PI/2.0-0.05, g_view_pitch));
+                g_mx_prev = ev.motion.x; g_my_prev = ev.motion.y;
+            }
+            break;
+        case SDL_MOUSEWHEEL:
+            if (!g_map_mode) {
+                g_zoom *= (ev.wheel.y > 0) ? 1.12 : (1.0/1.12);
+                g_zoom  = fmax(ZOOM_MIN, fmin(ZOOM_MAX, g_zoom));
+            }
+            break;
+        }
+    }
+
+    /* ── Physics ─────────────────────────────────────── */
+    uint32_t t_now = SDL_GetTicks();
+    double dt_real = (t_now - g_t_prev) * 0.001;
+    if (dt_real > 0.1) dt_real = 0.1;
+    g_t_prev = t_now;
+
+    if (!g_paused) {
+        g_sim_acc += g_time_scale * dt_real;
+        int steps = 0;
+        while (g_sim_acc >= DT_PHYS && steps < 600) {
+            for (int i=0; i<NUM_SATS; i++)
+                sat_step(&g_sats[i], DT_PHYS, g_use_j2, g_earth_angle);
+            for (int i=0; i<GPS_N; i++)
+                gps_step(&gps_sats[i], DT_PHYS, g_use_j2);
+            g_earth_angle += OMEGA_E * DT_PHYS;
+            g_sim_time    += DT_PHYS;
+            g_sim_acc     -= DT_PHYS;
+            steps++;
+        }
+        if (g_sim_acc > DT_PHYS) g_sim_acc = 0.0;
+    }
+
+    /* ── Render ──────────────────────────────────────── */
+    SDL_SetRenderDrawColor(g_ren, 0,0,0, 255);
+    SDL_RenderClear(g_ren);
+
+    if (g_map_mode) {
+        render_map_view(g_ren, g_map_tex, g_sats,
+                        g_earth_angle, g_sim_time, g_paused,
+                        g_use_j2, g_show_gps, g_show_fp,
+                        g_recording, g_frame_count);
+    } else {
+        for (int i=0; i<N_STARS; i++) {
+            SDL_SetRenderDrawColor(g_ren, star_b[i],star_b[i],star_b[i],255);
+            SDL_RenderDrawPoint(g_ren, star_x[i], star_y[i]);
+        }
+
+        double Rpx = BASE_R * g_zoom;
+        void *raw; int pitch;
+        SDL_LockTexture(g_earth_tex, NULL, &raw, &pitch);
+        memset(raw, 0, (size_t)pitch * WIN_H);
+        render_earth((uint32_t*)raw, pitch/4, Rpx,
+                     g_view_yaw, g_view_pitch, g_earth_angle);
+        SDL_UnlockTexture(g_earth_tex);
+        SDL_RenderCopy(g_ren, g_earth_tex, NULL, NULL);
+
+        for (int i=0; i<NUM_SATS; i++)
+            if (g_sats[i].visible)
+                render_orbit(g_ren, g_sats[i].el, Rpx, g_view_yaw, g_view_pitch);
+
+        if (g_show_gt)
+            render_ground_tracks(g_ren, g_sats, Rpx,
+                                 g_view_yaw, g_view_pitch, g_earth_angle);
+
+        if (g_show_fp) {
+            for (int i=0; i<NUM_SATS; i++)
+                if (g_sats[i].visible)
+                    render_footprint_3d(g_ren, g_sats[i].pos,
+                                        g_sats[i].el->cr, g_sats[i].el->cg, g_sats[i].el->cb,
+                                        Rpx, g_view_yaw, g_view_pitch);
+            if (g_show_gps)
+                for (int i=0; i<GPS_N; i++)
+                    render_footprint_3d(g_ren, gps_sats[i].pos,
+                                        gps_sats[i].el->cr, gps_sats[i].el->cg, gps_sats[i].el->cb,
+                                        Rpx, g_view_yaw, g_view_pitch);
+        }
+
+        if (g_show_gps) render_gps_3d(g_ren, Rpx, g_view_yaw, g_view_pitch);
+
+        for (int i=0; i<NUM_SATS; i++)
+            if (g_sats[i].visible)
+                render_satellite(g_ren, &g_sats[i], Rpx, g_view_yaw, g_view_pitch);
+
+        render_hud(g_ren, g_sats, g_time_scale, g_sim_time,
+                   g_paused, g_use_j2, g_show_gt, g_show_gps, g_show_fp,
+                   g_recording, g_frame_count);
+    }
+
+    if (g_recording) video_frame(g_ren);
+    SDL_RenderPresent(g_ren);
+    g_frame_count++;
+}
+
 /* ======================================================================
    Main
    ====================================================================== */
 int main(void) {
-    if (SDL_Init(SDL_INIT_VIDEO)<0) {
-        fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1;
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
     }
 
-    SDL_Window *win=SDL_CreateWindow(
+    /* Create window at the fixed sim resolution.  CSS in shell.html scales
+       the canvas visually; we do NOT use SDL_WINDOW_RESIZABLE because in
+       Emscripten that makes SDL2 track CSS size changes and re-register its
+       event listeners, which breaks keyboard input in the browser.           */
+    SDL_Window *win = SDL_CreateWindow(
         "Earth Satellite Orbit Simulation",
-        SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
-        WIN_W,WIN_H,SDL_WINDOW_SHOWN);
-    if (!win) { fprintf(stderr,"SDL_CreateWindow: %s\n",SDL_GetError()); return 1; }
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WIN_W, WIN_H,
+        SDL_WINDOW_SHOWN
+    );
+    if (!win) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
-    SDL_Renderer *ren=SDL_CreateRenderer(win,-1,
-        SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
-    if (!ren) { fprintf(stderr,"SDL_CreateRenderer: %s\n",SDL_GetError()); return 1; }
+    g_ren = SDL_CreateRenderer(win, -1,
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!g_ren) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
 
-    SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_BLEND);
+    /* No SDL_RenderSetLogicalSize needed: without SDL_WINDOW_RESIZABLE the
+       SDL renderer stays fixed at WIN_W×WIN_H, so all draw calls and
+       SDL_RenderCopy already share the same coordinate space.  Setting a
+       logical size causes Emscripten to internally resize the canvas element,
+       which resets its event listeners and breaks keyboard input.            */
+    SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 
-    SDL_Texture *earth_tex=SDL_CreateTexture(ren,
-        SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,WIN_W,WIN_H);
-    if (!earth_tex) { fprintf(stderr,"SDL_CreateTexture: %s\n",SDL_GetError()); return 1; }
+    g_earth_tex = SDL_CreateTexture(g_ren,
+        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, WIN_W, WIN_H);
+    if (!g_earth_tex) { fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return 1; }
 
     printf("Building land mask..."); fflush(stdout);
     build_land_mask();
     printf(" done\n");
 
-    /* Mercator y-range */
     g_map_y_max = log(tan(PI/4.0 + MAP_LAT_CLIP/2.0));
 
     printf("Building Mercator map texture (Natural Earth 1:50m)..."); fflush(stdout);
-    SDL_Texture *map_tex = build_mercator_texture(ren);
-    if (!map_tex) { fprintf(stderr,"build_mercator_texture failed\n"); return 1; }
+    g_map_tex = build_mercator_texture(g_ren);
+    if (!g_map_tex) { fprintf(stderr, "build_mercator_texture failed\n"); return 1; }
     printf(" done\n");
 
     build_stars();
 
-    Sat sats[NUM_SATS];
-    for (int i=0; i<NUM_SATS; i++) sat_init(&sats[i],&ORBITS[i]);
-    for (int i=0; i<GPS_N; i++)    gps_init(&gps_sats[i],&GPS_ORBITS[i]);
+    for (int i=0; i<NUM_SATS; i++) sat_init(&g_sats[i], &ORBITS[i]);
+    for (int i=0; i<GPS_N;     i++) gps_init(&gps_sats[i], &GPS_ORBITS[i]);
 
-    double view_yaw   = 0.2;
-    double view_pitch = 0.45;
-    double zoom       = ZOOM_INIT;
-    double earth_angle= 0.0;
-    double sim_time   = 0.0;
-    double sim_acc    = 0.0;
-    double time_scale = 800.0;
+    g_t_prev = SDL_GetTicks();
 
-    int paused            = 0;
-    int dragging          = 0;
-    int mx_prev=0, my_prev=0;
-    int use_j2            = 0;
-    int show_ground_track = 0;
-    int map_mode          = 0;
-    int show_gps          = 0;   /* C toggle — full GPS constellation */
-    int show_fp           = 0;   /* F toggle — footprint circles */
-    int recording         = 0;
-    uint32_t frame_count  = 0;
-
-    uint32_t t_prev=SDL_GetTicks();
-    int running=1;
-    SDL_Event ev;
-
-    while (running) {
-        /* ── Events ───────────────────────────────────── */
-        while (SDL_PollEvent(&ev)) {
-            switch (ev.type) {
-            case SDL_QUIT: running=0; break;
-            case SDL_KEYDOWN:
-                switch (ev.key.keysym.sym) {
-                case SDLK_ESCAPE: case SDLK_q: running=0; break;
-                case SDLK_SPACE:
-                    paused = !paused;
-                    if (!paused) {
-                        /* Discard any accumulated backlog so the simulation
-                           resumes smoothly rather than jumping forward.      */
-                        sim_acc = 0.0;
-                        t_prev  = SDL_GetTicks();
-                    }
-                    break;
-                case SDLK_p:      map_mode=!map_mode; break;
-                case SDLK_r:
-                    if (!map_mode) { view_yaw=0.2;view_pitch=0.45;zoom=ZOOM_INIT; }
-                    break;
-                case SDLK_EQUALS: case SDLK_PLUS:
-                    time_scale=fmin(time_scale*2.0,1e6); break;
-                case SDLK_MINUS:
-                    time_scale=fmax(time_scale/2.0,1.0); break;
-                case SDLK_j:
-                    use_j2=!use_j2;
-                    printf("J2: %s\n",use_j2?"ON":"OFF"); break;
-                case SDLK_c:
-                    show_gps=!show_gps; break;
-                case SDLK_f:
-                    show_fp=!show_fp; break;
-                case SDLK_g:
-                    if (!map_mode) show_ground_track=!show_ground_track;
-                    break;
-                case SDLK_v:
-                    if (!recording) { if (video_start()) recording=1; }
-                    else            { video_stop(); recording=0; }
-                    break;
-                case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
-                case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: {
-                    int idx=ev.key.keysym.sym-SDLK_1;
-                    if (idx<NUM_SATS) {
-                        sats[idx].visible ^= 1;
-                        if (sats[idx].visible) {
-                            /* Re-enabled: insert a break sentinel so the
-                               ground track renderer doesn't connect the old
-                               track to the new one with a straight line.   */
-                            Sat *s = &sats[idx];
-                            s->gt_lat[s->gt_head] = GT_BREAK;
-                            s->gt_lon[s->gt_head] = 0.0f;
-                            s->gt_head = (s->gt_head + 1) % GT_LEN;
-                            if (s->gt_cnt < GT_LEN) s->gt_cnt++;
-                            /* Also discard stale 3D trail positions */
-                            s->trail_cnt  = 0;
-                            s->trail_head = 0;
-                        }
-                    }
-                    break; }
-                }
-                break;
-            case SDL_MOUSEBUTTONDOWN:
-                if (!map_mode && ev.button.button==SDL_BUTTON_LEFT) {
-                    dragging=1; mx_prev=ev.button.x; my_prev=ev.button.y;
-                }
-                break;
-            case SDL_MOUSEBUTTONUP:
-                if (ev.button.button==SDL_BUTTON_LEFT) dragging=0;
-                break;
-            case SDL_MOUSEMOTION:
-                if (!map_mode && dragging) {
-                    view_yaw  +=(ev.motion.x-mx_prev)*0.006;
-                    view_pitch+=(ev.motion.y-my_prev)*0.006;
-                    view_pitch =fmax(-PI/2.0+0.05,fmin(PI/2.0-0.05,view_pitch));
-                    mx_prev=ev.motion.x; my_prev=ev.motion.y;
-                }
-                break;
-            case SDL_MOUSEWHEEL:
-                if (!map_mode) {
-                    zoom*=(ev.wheel.y>0)?1.12:(1.0/1.12);
-                    zoom=fmax(ZOOM_MIN,fmin(ZOOM_MAX,zoom));
-                }
-                break;
-            }
-        }
-
-        /* ── Physics ──────────────────────────────────── */
-        uint32_t t_now=SDL_GetTicks();
-        double dt_real=(t_now-t_prev)*0.001;
-        if (dt_real>0.1) dt_real=0.1;
-        t_prev=t_now;
-
-        if (!paused) {
-            sim_acc += time_scale * dt_real;
-            int steps = 0;
-            while (sim_acc >= DT_PHYS && steps < 600) {
-                for (int i=0; i<NUM_SATS; i++)
-                    sat_step(&sats[i], DT_PHYS, use_j2, earth_angle); /* always */
-                for (int i=0; i<GPS_N; i++)
-                    gps_step(&gps_sats[i], DT_PHYS, use_j2);          /* always */
-                earth_angle += OMEGA_E * DT_PHYS;
-                sim_time    += DT_PHYS;
-                sim_acc     -= DT_PHYS;
-                steps++;
-            }
-            /* If physics is capped (time_scale too high to keep up),
-               discard the excess rather than letting the backlog grow.
-               Without this, resuming from pause would cause a large jump. */
-            if (sim_acc > DT_PHYS) sim_acc = 0.0;
-        }
-
-        /* ── Render ───────────────────────────────────── */
-        SDL_SetRenderDrawColor(ren,0,0,0,255);
-        SDL_RenderClear(ren);
-
-        if (map_mode) {
-            /* ── 2D Mercator map mode ─────────────────── */
-            render_map_view(ren,map_tex,sats,
-                            earth_angle,sim_time,paused,
-                            use_j2,show_gps,show_fp,recording,frame_count);
-        } else {
-            /* ── 3D sphere mode ───────────────────────── */
-            for (int i=0; i<N_STARS; i++) {
-                SDL_SetRenderDrawColor(ren,star_b[i],star_b[i],star_b[i],255);
-                SDL_RenderDrawPoint(ren,star_x[i],star_y[i]);
-            }
-
-            double Rpx=BASE_R*zoom;
-            void *raw; int pitch;
-            SDL_LockTexture(earth_tex,NULL,&raw,&pitch);
-            memset(raw,0,(size_t)pitch*WIN_H);
-            render_earth((uint32_t*)raw,pitch/4,Rpx,view_yaw,view_pitch,earth_angle);
-            SDL_UnlockTexture(earth_tex);
-            SDL_RenderCopy(ren,earth_tex,NULL,NULL);
-
-            for (int i=0; i<NUM_SATS; i++)
-                if (sats[i].visible)
-                    render_orbit(ren,sats[i].el,Rpx,view_yaw,view_pitch);
-
-            if (show_ground_track)
-                render_ground_tracks(ren,sats,Rpx,view_yaw,view_pitch,earth_angle);
-
-            /* Footprints drawn before satellite dots so dots sit on top */
-            if (show_fp) {
-                for (int i=0; i<NUM_SATS; i++)
-                    if (sats[i].visible)
-                        render_footprint_3d(ren, sats[i].pos,
-                                            sats[i].el->cr, sats[i].el->cg, sats[i].el->cb,
-                                            Rpx, view_yaw, view_pitch);
-                if (show_gps)
-                    for (int i=0; i<GPS_N; i++)
-                        render_footprint_3d(ren, gps_sats[i].pos,
-                                            gps_sats[i].el->cr, gps_sats[i].el->cg, gps_sats[i].el->cb,
-                                            Rpx, view_yaw, view_pitch);
-            }
-
-            if (show_gps) render_gps_3d(ren, Rpx, view_yaw, view_pitch);
-
-            for (int i=0; i<NUM_SATS; i++)
-                if (sats[i].visible)
-                    render_satellite(ren,&sats[i],Rpx,view_yaw,view_pitch);
-
-            render_hud(ren,sats,time_scale,sim_time,
-                       paused,use_j2,show_ground_track,show_gps,show_fp,recording,frame_count);
-        }
-
-        if (recording) video_frame(ren);
-        SDL_RenderPresent(ren);
-        frame_count++;
+#ifdef __EMSCRIPTEN__
+    /* Hand control to the browser event loop.
+       fps=0  → use requestAnimationFrame (matches display refresh).
+       simulate_infinite_loop=1 → emscripten_set_main_loop never returns,
+       which is fine because all cleanup is handled by the browser unloading
+       the page.  Desktop cleanup code is therefore guarded by #ifndef below. */
+    emscripten_set_main_loop(main_loop, 0, 1);
+#else
+    while (g_running) {
+        main_loop();
     }
 
-    if (recording) video_stop();
-    SDL_DestroyTexture(map_tex);
-    SDL_DestroyTexture(earth_tex);
-    SDL_DestroyRenderer(ren);
+    if (g_recording) video_stop();
+    SDL_DestroyTexture(g_map_tex);
+    SDL_DestroyTexture(g_earth_tex);
+    SDL_DestroyRenderer(g_ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
+#endif
     return 0;
 }
