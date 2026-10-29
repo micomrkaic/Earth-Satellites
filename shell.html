@@ -41,8 +41,9 @@
     </div>
   </div>
   <div id="hint">
-    1-8 satellites &middot; P map &middot; Space pause &middot;
-    +/- speed &middot; J J2 &middot; C GPS &middot; F footprint &middot; R reset
+    1-8 satellites &middot; P map &middot; Space pause &middot; +/- speed &middot;
+    J J2 &middot; C GPS &middot; F footprint &middot; R reset &middot;
+    [ reset epoch &middot; ] +1 day &middot; H help &middot; click satellite for info &middot; drop .tle to import
   </div>
 
   <script>
@@ -52,25 +53,86 @@
     var KEY_MAP = {
       'Space':32,'Escape':27,'Equal':61,'Minus':45,
       'KeyQ':113,'KeyR':114,'KeyJ':106,'KeyG':103,
-      'KeyP':112,'KeyC':99,'KeyF':102,'KeyV':118,
+      'KeyH':104,'KeyP':112,'KeyC':99,'KeyF':102,'KeyV':118,
       'Digit1':49,'Digit2':50,'Digit3':51,'Digit4':52,
-      'Digit5':53,'Digit6':54,'Digit7':55,'Digit8':56
+      'Digit5':53,'Digit6':54,'Digit7':55,'Digit8':56,
+      'BracketLeft':91,'BracketRight':93   /* [ ] epoch skip */
     };
 
-    /* Capture phase on window — fires regardless of which element has
-       DOM focus, regardless of iframe sandboxing.                      */
+    /* Key queue (#3): FIFO array; C drains one per call via EM_ASM_INT.
+       Capture phase fires regardless of DOM focus / iframe sandboxing.  */
+    window._wkq = [];
     window.addEventListener('keydown', function(e) {
       var sym = KEY_MAP[e.code];
       if (sym !== undefined) {
-        window._wk = sym;     /* C reads this via EM_ASM_INT each frame */
+        window._wkq.push(sym);
         e.preventDefault();
       }
     }, true);
 
-    /* Also keep canvas focused for SDL2's own mouse/scroll handling    */
     var canvas = document.getElementById('canvas');
+
+    /* Keep canvas focused for SDL2's own mouse/scroll handling          */
     canvas.addEventListener('mousedown', function() { canvas.focus(); });
     window.addEventListener('resize', function() { canvas.focus(); });
+
+    /* Touch support (#4): single-finger drag → rotate; two-finger pinch → zoom.
+       Deltas are accumulated in canvas-space pixels; C polls them via EM_ASM.  */
+    window._tdx = 0; window._tdy = 0; window._tpinch = 0;
+    var _lastTouch = null, _lastPinchDist = 0;
+
+    canvas.addEventListener('touchstart', function(e) {
+      e.preventDefault(); canvas.focus();
+      if (e.touches.length === 1) {
+        var r = canvas.getBoundingClientRect();
+        var scale = 1200 / r.width;
+        _lastTouch = { x: e.touches[0].clientX * scale,
+                       y: e.touches[0].clientY * scale };
+        _lastPinchDist = 0;
+      } else if (e.touches.length === 2) {
+        var dx = e.touches[0].clientX - e.touches[1].clientX;
+        var dy = e.touches[0].clientY - e.touches[1].clientY;
+        _lastPinchDist = Math.sqrt(dx*dx + dy*dy);
+        _lastTouch = null;
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', function(e) {
+      e.preventDefault();
+      if (e.touches.length === 1 && _lastTouch) {
+        var r = canvas.getBoundingClientRect();
+        var scale = 1200 / r.width;
+        var cx = e.touches[0].clientX * scale;
+        var cy = e.touches[0].clientY * scale;
+        window._tdx += cx - _lastTouch.x;
+        window._tdy += cy - _lastTouch.y;
+        _lastTouch = { x: cx, y: cy };
+      } else if (e.touches.length === 2) {
+        var dx = e.touches[0].clientX - e.touches[1].clientX;
+        var dy = e.touches[0].clientY - e.touches[1].clientY;
+        var dist = Math.sqrt(dx*dx + dy*dy);
+        if (_lastPinchDist > 0) window._tpinch += dist - _lastPinchDist;
+        _lastPinchDist = dist;
+        _lastTouch = null;
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', function(e) {
+      e.preventDefault();
+      if (e.touches.length === 0) { _lastTouch = null; _lastPinchDist = 0; }
+    }, { passive: false });
+
+    /* TLE drag-and-drop (#8): drop a .tle text file onto the canvas.
+       Contents are stored in window._tleText; C polls and clears it.   */
+    canvas.addEventListener('dragover', function(e) { e.preventDefault(); });
+    canvas.addEventListener('drop', function(e) {
+      e.preventDefault();
+      var file = e.dataTransfer.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(ev) { window._tleText = ev.target.result; };
+      reader.readAsText(file);
+    });
 
     var loadingDiv  = document.getElementById('loading');
     var progressBar = document.getElementById('progress-bar-inner');

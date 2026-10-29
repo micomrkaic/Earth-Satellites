@@ -4,6 +4,7 @@
 // Controls:
 //   Left-drag    rotate view (3D mode)
 //   Scroll       zoom in/out (3D mode)
+//   Click sat    show info panel (altitude, speed, period, inclination)
 //   +/=          faster
 //   -            slower
 //   1-8          toggle satellite
@@ -12,8 +13,14 @@
 //   J            toggle J2 oblateness perturbation
 //   G            toggle ground track display (3D mode)
 //   P            toggle Mercator map / 3D sphere view
+//   ]            fast-forward one sidereal day
+//   [            reset to t=0
 //   V            start/stop MP4 video capture  (requires ffmpeg in PATH)
 //   Q / Esc      quit
+// WASM extras:
+//   Touch drag   rotate (3D mode)
+//   Pinch        zoom in/out (3D mode)
+//   Drop .tle    import TLE file → replaces satellite 8
 
 #include <SDL2/SDL.h>
 #include <math.h>
@@ -59,6 +66,11 @@
    satellite is re-enabled, so the drawing code can skip that segment.  */
 #define GT_LEN    1500
 #define GT_BREAK  99.0f   /* sentinel: valid lat range is ±π/2 ≈ ±1.57 */
+
+/* J2000.0 = 2000-01-01 12:00:00 UTC as Unix timestamp */
+#define J2000_UNIX   946728000.0
+/* Earth sidereal rotation period in seconds */
+#define SIDEREAL_DAY  86164.0905
 
 /* Mercator map clipped to ±82° latitude, right edge leaves room for panel */
 #define MAP_LAT_CLIP (82.0 * DEG)
@@ -360,6 +372,11 @@ static void el_to_state(const OrbEl *el, V3 *pos, V3 *vel) {
     double vr=(GM/h)*el->e*sin(nu), vt=(GM/h)*(1.0+el->e*cos(nu));
     double vxo=vr*cos(nu)-vt*sin(nu), vyo=vr*sin(nu)+vt*cos(nu);
     *vel=(V3){Px*vxo+Qx*vyo, Py*vxo+Qy*vyo, Pz*vxo+Qz*vyo};
+}
+
+/* Orbital period in seconds for a given semi-major axis */
+static double orbit_period(double a) {
+    return 2.0 * PI * sqrt(a * a * a / GM);
 }
 
 /* ======================================================================
@@ -674,10 +691,6 @@ static void render_gps_map(SDL_Renderer *ren, double earth_angle)
 /* These are needed by both the NE helpers and build_mercator_texture */
 static double   g_map_y_max;                    /* log(tan(π/4 + clip/2)) */
 static uint32_t map_tex_buf[WIN_H * WIN_W];     /* 3.7 MB in BSS          */
-#ifdef __EMSCRIPTEN__
-static int g_wasm_key_count = 0;  /* increments each time a JS key is polled */
-static int g_wasm_last_key  = -1; /* last SDL keycode received from JS */
-#endif
 
 /* Degrees → pixel (uses g_map_y_max, set before build_mercator_texture) */
 static int ne_lx(double lon_d) {
@@ -1154,6 +1167,13 @@ static void render_satellite(SDL_Renderer *ren, const Sat *s,
                               double Rpx, double view_yaw, double view_pitch)
 {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    /* Altitude-based trail colour for eccentric orbits (#9):
+       perigee → deep red/orange; apogee → satellite's base colour.
+       Circular orbits use the plain fade as before.                  */
+    double alt_lo = s->el->a * (1.0 - s->el->e) - RE;
+    double alt_hi = s->el->a * (1.0 + s->el->e) - RE;
+    int eccentric = (s->el->e > 0.05);
+
     for (int k=0; k<s->trail_cnt; k++) {
         int idx=(s->trail_head-1-k+TRAIL_LEN)%TRAIL_LEN;
         V3 tv=eci_to_view(s->trail[idx],view_yaw,view_pitch);
@@ -1161,8 +1181,22 @@ static void render_satellite(SDL_Renderer *ren, const Sat *s,
         int tsx=px_x(tv,Rpx),tsy=px_y(tv,Rpx);
         if (tsx<0||tsx>=WIN_W||tsy<0||tsy>=WIN_H) continue;
         float f=1.0f-(float)k/(float)s->trail_cnt;
-        SDL_SetRenderDrawColor(ren,(uint8_t)(s->el->cr*f),(uint8_t)(s->el->cg*f),
-                               (uint8_t)(s->el->cb*f),(uint8_t)(f*f*180));
+        uint8_t tr,tg,tb;
+        if (eccentric) {
+            double alt = v3len(s->trail[idx]) - RE;
+            double t = (alt_hi > alt_lo) ? (alt - alt_lo)/(alt_hi - alt_lo) : 0.5;
+            if (t<0.0) t=0.0; if (t>1.0) t=1.0;
+            /* Bright cyan at perigee (fast/low) → satellite colour at apogee.
+               Cyan contrasts with every base colour including Molniya's red. */
+            tr = (uint8_t)((  0.0*(1.0-t) + s->el->cr*t) * f);
+            tg = (uint8_t)((220.0*(1.0-t) + s->el->cg*t) * f);
+            tb = (uint8_t)((255.0*(1.0-t) + s->el->cb*t) * f);
+        } else {
+            tr=(uint8_t)(s->el->cr*f);
+            tg=(uint8_t)(s->el->cg*f);
+            tb=(uint8_t)(s->el->cb*f);
+        }
+        SDL_SetRenderDrawColor(ren,tr,tg,tb,(uint8_t)(f*f*180));
         SDL_RenderDrawPoint(ren,tsx,tsy);
     }
     V3 sv=eci_to_view(s->pos,view_yaw,view_pitch);
@@ -1180,8 +1214,159 @@ static void render_satellite(SDL_Renderer *ren, const Sat *s,
 }
 
 /* ======================================================================
+   Sun direction indicator (#6)
+   Sun is at ECI +X.  If in front of Earth: draw a star glyph.
+   If behind: draw a dimmer indicator at the sphere limb.
+   ====================================================================== */
+static void render_sun_indicator(SDL_Renderer *ren, double Rpx,
+                                  double view_yaw, double view_pitch)
+{
+    V3 sv = eci_to_view((V3){RE,0,0}, view_yaw, view_pitch); /* sun at ECI +X */
+    int sx, sy;
+    uint8_t alpha;
+    if (sv.z >= 0.0) {
+        /* Sun facing us */
+        sx = px_x(sv, Rpx);
+        sy = px_y(sv, Rpx);
+        alpha = 220;
+    } else {
+        /* Sun behind Earth — show on sphere limb */
+        double mag = sqrt(sv.x*sv.x + sv.y*sv.y);
+        if (mag < 1e-9) return;
+        sx = (int)(CX + Rpx * 1.06 * sv.x / mag);
+        sy = (int)(CY - Rpx * 1.06 * sv.y / mag);
+        alpha = 80;
+    }
+    if (sx < 0 || sx >= WIN_W || sy < 0 || sy >= WIN_H) return;
+
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    /* Soft glow */
+    SDL_SetRenderDrawColor(ren, 255, 220, 60, (uint8_t)(alpha/5));
+    for (int dy=-9; dy<=9; dy++)
+        for (int dx=-9; dx<=9; dx++)
+            if (dx*dx+dy*dy<=81)
+                SDL_RenderDrawPoint(ren, sx+dx, sy+dy);
+    /* Core */
+    SDL_SetRenderDrawColor(ren, 255, 220, 60, alpha);
+    for (int dy=-3; dy<=3; dy++)
+        for (int dx=-3; dx<=3; dx++)
+            if (dx*dx+dy*dy<=9)
+                SDL_RenderDrawPoint(ren, sx+dx, sy+dy);
+    /* Rays */
+    SDL_SetRenderDrawColor(ren, 255, 220, 60, (uint8_t)(alpha*3/4));
+    int rays[8][2]={{0,-8},{6,-6},{8,0},{6,6},{0,8},{-6,6},{-8,0},{-6,-6}};
+    for (int r=0; r<8; r++)
+        SDL_RenderDrawLine(ren, sx+rays[r][0]/2, sy+rays[r][1]/2,
+                                sx+rays[r][0],   sy+rays[r][1]);
+    if (sv.z >= 0.0)
+        draw_str(ren, sx+10, sy-4, "SUN", 255, 220, 60, 1);
+}
+
+/* ======================================================================
+   Satellite info panel — shown when a satellite is clicked (#1)
+   ====================================================================== */
+static void render_sat_info_panel(SDL_Renderer *ren, int idx,
+                                   const Sat sats[NUM_SATS])
+{
+    if (idx < 0 || idx >= NUM_SATS) return;
+    const Sat    *s = &sats[idx];
+    const OrbEl  *e = s->el;
+
+    int px0=10, py0=90, pw=210, ph=110;
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0,0,0, 210);
+    SDL_Rect bg={px0,py0,pw,ph}; SDL_RenderFillRect(ren,&bg);
+    SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 180);
+    SDL_RenderDrawRect(ren,&bg);
+
+    /* Title */
+    draw_str(ren, px0+6, py0+6, e->name, e->cr, e->cg, e->cb, 2);
+
+    double alt_km  = (v3len(s->pos) - RE) / 1000.0;
+    double spd_kms = v3len(s->vel) / 1000.0;
+    double T_s     = orbit_period(e->a);
+    double inc_deg = e->inc / DEG;
+    char buf[48];
+    int ly = py0 + 22;
+    snprintf(buf,sizeof(buf),"ALT  %.0f km", alt_km);
+    draw_str(ren, px0+6, ly, buf, 180,220,180, 1); ly+=13;
+    snprintf(buf,sizeof(buf),"SPD  %.2f km/s", spd_kms);
+    draw_str(ren, px0+6, ly, buf, 180,220,180, 1); ly+=13;
+    if (T_s < 7200.0)
+        snprintf(buf,sizeof(buf),"PER  %.1f min", T_s/60.0);
+    else
+        snprintf(buf,sizeof(buf),"PER  %.2f h", T_s/3600.0);
+    draw_str(ren, px0+6, ly, buf, 180,220,180, 1); ly+=13;
+    snprintf(buf,sizeof(buf),"INC  %.1f DEG", inc_deg);
+    draw_str(ren, px0+6, ly, buf, 180,220,180, 1); ly+=13;
+    snprintf(buf,sizeof(buf),"ECC  %.4f", e->e);
+    draw_str(ren, px0+6, ly, buf, 180,220,180, 1); ly+=14;
+    draw_str(ren, px0+6, ly, "CLICK TO DISMISS", 60,80,60, 1);
+}
+
+/* ======================================================================
    3D HUD
    ====================================================================== */
+/* ======================================================================
+   Help overlay — toggled with H
+   ====================================================================== */
+static void render_help_overlay(SDL_Renderer *ren)
+{
+    /* Semi-transparent full-screen dim */
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 200);
+    SDL_Rect full = {0, 0, WIN_W, WIN_H};
+    SDL_RenderFillRect(ren, &full);
+
+    /* Panel */
+    int pw = 560, ph = 360;
+    int px = (WIN_W - pw) / 2, py = (WIN_H - ph) / 2;
+    SDL_SetRenderDrawColor(ren, 10, 18, 30, 240);
+    SDL_Rect panel = {px, py, pw, ph};
+    SDL_RenderFillRect(ren, &panel);
+    SDL_SetRenderDrawColor(ren, 60, 100, 160, 255);
+    SDL_RenderDrawRect(ren, &panel);
+
+    /* Title */
+    draw_str(ren, px+pw/2 - 11*3, py+12, "KEY BINDINGS", 100, 200, 255, 2);
+
+    static const char *keys[][2] = {
+        {"SPACE",      "Pause / resume"},
+        {"+  /  -",    "Speed up / slow down"},
+        {"1 - 8",      "Toggle satellite on/off"},
+        {"R",          "Reset view"},
+        {"P",          "Toggle map / 3D view"},
+        {"J",          "Toggle J2 oblateness"},
+        {"G",          "Toggle ground tracks (3D)"},
+        {"C",          "Toggle GPS constellation"},
+        {"F",          "Toggle footprint circles"},
+        {"]",          "Fast-forward one sidereal day"},
+        {"[",          "Reset to epoch t=0"},
+        {"H",          "Show / hide this help"},
+        {"V",          "Start / stop video capture"},
+        {"Q / Esc",    "Quit"},
+        {"Scroll",     "Zoom in / out"},
+        {"Drag",       "Rotate globe (3D)"},
+        {"Click sat",  "Show orbital info panel"},
+        {"Drop .tle",  "Import TLE file (replaces sat 8)"},
+    };
+    int nkeys = (int)(sizeof(keys)/sizeof(keys[0]));
+    int half  = pw / 2;   /* 280 px per column */
+    for (int i = 0; i < nkeys; i++) {
+        int col  = i / 9;               /* 0 = left, 1 = right */
+        int row  = i % 9;
+        int kx   = px + col*half + 14;  /* key label x */
+        int vx   = px + col*half + 90;  /* value label x */
+        int y    = py + 38 + row * 17;
+        draw_str(ren, kx, y, keys[i][0], 120, 200, 255, 1);
+        draw_str(ren, vx, y, keys[i][1], 200, 200, 200, 1);
+    }
+
+    /* Footer */
+    draw_str(ren, px + pw/2 - 5*6*1, py+ph-18,
+             "PRESS H TO CLOSE", 80, 80, 80, 1);
+}
+
 static void render_hud(SDL_Renderer *ren,
                         const Sat sats[NUM_SATS],
                         double time_scale, double sim_time,
@@ -1207,6 +1392,15 @@ static void render_hud(SDL_Renderer *ren,
         char label[32]; snprintf(label,sizeof(label),"%d %s",i+1,e->name);
         draw_str(ren,WIN_W-180,y,label,
                  sats[i].visible?e->cr:80, sats[i].visible?e->cg:80, sats[i].visible?e->cb:80,1);
+        /* Orbital period (#2) */
+        double T_s = orbit_period(e->a);
+        char per[20];
+        if (T_s < 7200.0) snprintf(per,sizeof(per),"%.0fm",  T_s/60.0);
+        else               snprintf(per,sizeof(per),"%.1fh",  T_s/3600.0);
+        draw_str(ren, WIN_W-196, y+11, per,
+                 sats[i].visible?(uint8_t)(e->cr*6/10):40,
+                 sats[i].visible?(uint8_t)(e->cg*6/10):40,
+                 sats[i].visible?(uint8_t)(e->cb*6/10):40, 1);
     }
 
     int ty=28+NUM_SATS*26+6;
@@ -1221,21 +1415,25 @@ static void render_hud(SDL_Renderer *ren,
     draw_str(ren,WIN_W-112,ty, show_fp?"ON ":"OFF", show_fp?80:150, show_fp?210:150, show_fp?80:150,1);
 
     char buf[160];
-    double days=sim_time/86400.0, hours=fmod(sim_time,86400.0)/3600.0;
     snprintf(buf,sizeof(buf),"SPEED: %gX",time_scale);
     draw_str(ren,10,WIN_H-22,buf,180,220,180,1);
-    snprintf(buf,sizeof(buf),"SIM: %4.0fD %05.2fH",days,hours);
-    draw_str(ren,160,WIN_H-22,buf,180,180,220,1);
 
-    if (paused) draw_str(ren,420,WIN_H-22,"PAUSED",255,200,50,2);
-#ifdef __EMSCRIPTEN__
+    /* Simulated UTC date (#5): J2000.0 + sim_time */
     {
-        char kbuf[40];
-        snprintf(kbuf,sizeof(kbuf),"JS-KEY CNT=%d LAST=%d",
-                 g_wasm_key_count, g_wasm_last_key);
-        draw_str(ren,10,WIN_H-64,kbuf,200,100,100,1);
+        time_t t = (time_t)(J2000_UNIX + sim_time);
+        struct tm *tm = gmtime(&t);
+        if (tm) {
+            snprintf(buf,sizeof(buf),"UTC %04d-%02d-%02d %02d:%02d:%02d",
+                     tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec);
+        } else {
+            double days=sim_time/86400.0, hours=fmod(sim_time,86400.0)/3600.0;
+            snprintf(buf,sizeof(buf),"SIM: %4.0fD %05.2fH",days,hours);
+        }
+        draw_str(ren,130,WIN_H-22,buf,180,180,220,1);
     }
-#endif
+
+    if (paused) draw_str(ren,560,WIN_H-22,"PAUSED",255,200,50,2);
 
     if (recording) {
         int blink=(frame_count/30)&1;
@@ -1243,9 +1441,9 @@ static void render_hud(SDL_Renderer *ren,
     }
 
     draw_str(ren,10,WIN_H-50,
-             "+/- SPEED   R RESET   SPC PAUSE   1-8 TOGGLE   SCROLL ZOOM",85,85,85,1);
+             "+/- SPEED   R RESET   SPC PAUSE   1-8 TOGGLE   [/] EPOCH   SCROLL ZOOM",85,85,85,1);
     draw_str(ren,10,WIN_H-38,
-             "J J2   G GRND TRK   C GPS   F FOOTPRINT   P MAP   V VIDEO   Q QUIT",85,85,85,1);
+             "J J2   G GT   C GPS   F FP   P MAP   H HELP   V VIDEO   CLICK SAT   Q QUIT",85,85,85,1);
 }
 
 /* ======================================================================
@@ -1327,6 +1525,15 @@ static uint32_t g_frame_count  = 0;
 static uint32_t g_t_prev       = 0;
 static int      g_running      = 1;
 
+/* ── Feature state ─────────────────────────────────────────────────────── */
+static int    g_selected_sat = -1;   /* clicked satellite info panel (-1=none) */
+static int    g_show_help    = 0;    /* H toggles full key-binding overlay      */
+
+/* TLE import: slot NUM_SATS-1 replaced when a .tle file is dropped        */
+static char   g_tle_name[32] = "";
+static int    g_tle_loaded   = 0;
+static OrbEl  g_tle_el;             /* storage for dynamically-loaded TLE    */
+
 /* ======================================================================
    WASM keyboard — polls a JS global variable set by shell.html.
    Avoids ALL C/JS function-call boundary issues:
@@ -1338,17 +1545,87 @@ static int      g_running      = 1;
    and clears it.  process_key() handles the rest.
    ====================================================================== */
 #ifdef __EMSCRIPTEN__
+/* Key queue (#3): JS pushes into window._wkq[]; C drains one per call. */
 static int wasm_poll_key(void)
 {
-    int k = EM_ASM_INT(
-        var k = (window._wk !== undefined) ? window._wk : -1;
-        window._wk = undefined;
-        return k
+    return EM_ASM_INT(
+        if (!window._wkq || window._wkq.length === 0) return -1;
+        return window._wkq.shift()
     );
-    if (k >= 0) { g_wasm_key_count++; g_wasm_last_key = k; }
-    return k;
 }
 #endif
+
+/* ======================================================================
+   TLE parser — replaces satellite slot NUM_SATS-1 with user's TLE (#8)
+   ====================================================================== */
+static void load_tle(const char *text)
+{
+    /* Scan lines; identify title, line 1, line 2 by first character */
+    char lines[3][80]; int nlines=0;
+    const char *p = text;
+    while (*p && nlines < 3) {
+        const char *end = p;
+        while (*end && *end != '\n' && *end != '\r') end++;
+        int len = (int)(end - p);
+        if (len > 0 && len < 80) {
+            strncpy(lines[nlines], p, (size_t)len);
+            lines[nlines][len] = '\0';
+            nlines++;
+        }
+        p = end;
+        while (*p == '\n' || *p == '\r') p++;
+    }
+
+    const char *l2 = NULL;
+    strncpy(g_tle_name, "TLE SAT", sizeof(g_tle_name)-1);
+    for (int i=0; i<nlines; i++) {
+        if (lines[i][0] == '2' && lines[i][1] == ' ') l2 = lines[i];
+        if (lines[i][0] != '1' && lines[i][0] != '2' && lines[i][0] != '\0') {
+            strncpy(g_tle_name, lines[i], sizeof(g_tle_name)-1);
+            /* Trim trailing whitespace */
+            for (int j=(int)strlen(g_tle_name)-1; j>=0; j--) {
+                if (g_tle_name[j]==' '||g_tle_name[j]=='\r'||g_tle_name[j]=='\t')
+                    g_tle_name[j]='\0';
+                else break;
+            }
+        }
+    }
+    if (!l2) { fprintf(stderr,"TLE: no line 2 found\n"); return; }
+
+    /* Parse TLE line 2:
+       2 NNNNN III.IIII RRR.RRRR EEEEEEE WWW.WWWW MMM.MMMM NN.NNNNNNNNRRRRRN */
+    int satnum, rev;
+    double inc, raan, ecc_raw, omega, M0, n;
+    if (sscanf(l2+2, "%5d %8lf %8lf %7lf %8lf %8lf %11lf%5d",
+               &satnum, &inc, &raan, &ecc_raw, &omega, &M0, &n, &rev) < 7) {
+        fprintf(stderr,"TLE: parse failed\n"); return;
+    }
+    double ecc = ecc_raw * 1e-7;           /* implicit decimal */
+    double n_rad = n * 2.0*PI / 86400.0;   /* rev/day → rad/s */
+    double a = cbrt(GM / (n_rad*n_rad));   /* vis-viva */
+
+    g_tle_el.a     = a;
+    g_tle_el.e     = ecc;
+    g_tle_el.inc   = inc   * DEG;
+    g_tle_el.Omega = raan  * DEG;
+    g_tle_el.omega = omega * DEG;
+    g_tle_el.M0    = M0    * DEG;
+    g_tle_el.name  = g_tle_name;
+    g_tle_el.cr    = 255;
+    g_tle_el.cg    = 220;
+    g_tle_el.cb    = 100;
+
+    int slot = NUM_SATS - 1;
+    g_sats[slot].el = &g_tle_el;
+    el_to_state(&g_tle_el, &g_sats[slot].pos, &g_sats[slot].vel);
+    g_sats[slot].trail_head = 0; g_sats[slot].trail_cnt  = 0; g_sats[slot].trail_ctr = 0;
+    g_sats[slot].gt_head    = 0; g_sats[slot].gt_cnt     = 0;
+    g_sats[slot].visible    = 1;
+    g_tle_loaded = 1;
+
+    printf("TLE loaded: %s  a=%.0f km  e=%.5f  i=%.2f deg  T=%.1f min\n",
+           g_tle_name, a/1000.0, ecc, inc, orbit_period(a)/60.0);
+}
 
 /* ======================================================================
    Key handler — shared between SDL event path (native + WASM SDL events)
@@ -1383,6 +1660,7 @@ static void process_key(SDL_Keycode sym)
         printf("J2: %s\n", g_use_j2 ? "ON" : "OFF"); break;
     case SDLK_c:  g_show_gps = !g_show_gps; break;
     case SDLK_f:  g_show_fp  = !g_show_fp;  break;
+    case SDLK_h:  g_show_help = !g_show_help; break;
     case SDLK_g:
         if (!g_map_mode) g_show_gt = !g_show_gt;
         break;
@@ -1391,6 +1669,30 @@ static void process_key(SDL_Keycode sym)
         if (!g_recording) { if (video_start()) g_recording=1; }
         else              { video_stop(); g_recording=0; }
 #endif
+        break;
+    /* Epoch skip: ] = fast-forward one sidereal day; [ = reset to t=0 (#7) */
+    case SDLK_RIGHTBRACKET: {
+        int steps = (int)(SIDEREAL_DAY / DT_PHYS + 0.5);
+        for (int s=0; s<steps; s++) {
+            for (int i=0; i<NUM_SATS; i++)
+                sat_step(&g_sats[i], DT_PHYS, g_use_j2, g_earth_angle);
+            for (int i=0; i<GPS_N; i++)
+                gps_step(&gps_sats[i], DT_PHYS, g_use_j2);
+            g_earth_angle += OMEGA_E * DT_PHYS;
+            g_sim_time    += DT_PHYS;
+        }
+        printf("Epoch +1 sidereal day (t=%.1f h)\n", g_sim_time/3600.0);
+        break; }
+    case SDLK_LEFTBRACKET:
+        /* Reset simulation to t=0 */
+        for (int i=0; i<NUM_SATS; i++) {
+            const OrbEl *el = (i==NUM_SATS-1 && g_tle_loaded) ? &g_tle_el : &ORBITS[i];
+            sat_init(&g_sats[i], el);
+        }
+        for (int i=0; i<GPS_N; i++) gps_init(&gps_sats[i], &GPS_ORBITS[i]);
+        g_earth_angle = 0.0; g_sim_time = 0.0; g_sim_acc = 0.0;
+        g_t_prev = SDL_GetTicks();
+        printf("Epoch reset to t=0\n");
         break;
     case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
     case SDLK_5: case SDLK_6: case SDLK_7: case SDLK_8: {
@@ -1420,11 +1722,48 @@ static void main_loop(void)
 {
     SDL_Event ev;
 
-    /* ── WASM keyboard poll ─────────────────────────── */
+    /* ── WASM keyboard poll — drain queue (#3) ─────── */
 #ifdef __EMSCRIPTEN__
     {
-        int _wk = wasm_poll_key();
-        if (_wk >= 0) process_key((SDL_Keycode)_wk);
+        int k;
+        while ((k = wasm_poll_key()) >= 0)
+            process_key((SDL_Keycode)k);
+    }
+    /* ── Touch drag → rotate / pinch → zoom (#4) ──── */
+    if (!g_map_mode) {
+        double tdx = EM_ASM_DOUBLE(
+            var v=window._tdx||0; window._tdx=0; return v;
+        );
+        double tdy = EM_ASM_DOUBLE(
+            var v=window._tdy||0; window._tdy=0; return v;
+        );
+        if (tdx != 0.0 || tdy != 0.0) {
+            g_view_yaw   += tdx * 0.006;
+            g_view_pitch += tdy * 0.006;
+            g_view_pitch  = fmax(-PI/2.0+0.05, fmin(PI/2.0-0.05, g_view_pitch));
+        }
+        double tpinch = EM_ASM_DOUBLE(
+            var v=window._tpinch||0; window._tpinch=0; return v;
+        );
+        if (tpinch != 0.0) {
+            g_zoom *= (tpinch > 0) ? 1.04 : (1.0/1.04);
+            g_zoom  = fmax(ZOOM_MIN, fmin(ZOOM_MAX, g_zoom));
+        }
+    }
+    /* ── TLE drag-and-drop (#8) ─────────────────────── */
+    {
+        int has_tle = EM_ASM_INT(
+            return (window._tleText !== undefined) ? 1 : 0;
+        );
+        if (has_tle) {
+            char buf[600];
+            EM_ASM({
+                var s = window._tleText || "";
+                stringToUTF8(s.substring(0,595), $0, 596);
+                window._tleText = undefined;
+            }, buf);
+            load_tle(buf);
+        }
     }
 #endif
 
@@ -1446,8 +1785,43 @@ static void main_loop(void)
 #endif
             break;
         case SDL_MOUSEBUTTONDOWN:
-            if (!g_map_mode && ev.button.button==SDL_BUTTON_LEFT) {
-                g_dragging=1; g_mx_prev=ev.button.x; g_my_prev=ev.button.y;
+            if (ev.button.button==SDL_BUTTON_LEFT) {
+                if (g_selected_sat >= 0) {
+                    /* Dismiss info panel on any click */
+                    g_selected_sat = -1;
+                } else if (!g_map_mode) {
+                    /* Try to select a satellite (#1) */
+                    double Rpx2 = BASE_R * g_zoom;
+                    int best=-1; float best_d=18.0f;
+                    for (int i=0; i<NUM_SATS; i++) {
+                        if (!g_sats[i].visible) continue;
+                        V3 sv2=eci_to_view(g_sats[i].pos,g_view_yaw,g_view_pitch);
+                        if (occluded(sv2,Rpx2)) continue;
+                        float dx=(float)(ev.button.x - px_x(sv2,Rpx2));
+                        float dy=(float)(ev.button.y - px_y(sv2,Rpx2));
+                        float d=sqrtf(dx*dx+dy*dy);
+                        if (d < best_d) { best_d=d; best=i; }
+                    }
+                    if (best >= 0) {
+                        g_selected_sat = best;
+                    } else {
+                        g_dragging=1; g_mx_prev=ev.button.x; g_my_prev=ev.button.y;
+                    }
+                } else {
+                    /* Map mode click: try to select satellite by map position */
+                    int best=-1; float best_d=18.0f;
+                    for (int i=0; i<NUM_SATS; i++) {
+                        if (!g_sats[i].visible) continue;
+                        V3 ef=rz(v3norm(g_sats[i].pos),-g_earth_angle);
+                        double lat=asin(fmax(-1.0,fmin(1.0,ef.z)));
+                        double lon=atan2(ef.y,ef.x);
+                        int mpx=map_lon_to_px(lon), mpy=map_lat_to_py(lat);
+                        float dx=(float)(ev.button.x-mpx), dy=(float)(ev.button.y-mpy);
+                        float d=sqrtf(dx*dx+dy*dy);
+                        if (d < best_d) { best_d=d; best=i; }
+                    }
+                    if (best >= 0) g_selected_sat = best;
+                }
             }
             break;
         case SDL_MOUSEBUTTONUP:
@@ -1501,6 +1875,8 @@ static void main_loop(void)
                         g_earth_angle, g_sim_time, g_paused,
                         g_use_j2, g_show_gps, g_show_fp,
                         g_recording, g_frame_count);
+        if (g_selected_sat >= 0)
+            render_sat_info_panel(g_ren, g_selected_sat, g_sats);
     } else {
         for (int i=0; i<N_STARS; i++) {
             SDL_SetRenderDrawColor(g_ren, star_b[i],star_b[i],star_b[i],255);
@@ -1543,10 +1919,17 @@ static void main_loop(void)
             if (g_sats[i].visible)
                 render_satellite(g_ren, &g_sats[i], Rpx, g_view_yaw, g_view_pitch);
 
+        render_sun_indicator(g_ren, Rpx, g_view_yaw, g_view_pitch);
+
         render_hud(g_ren, g_sats, g_time_scale, g_sim_time,
                    g_paused, g_use_j2, g_show_gt, g_show_gps, g_show_fp,
                    g_recording, g_frame_count);
+
+        if (g_selected_sat >= 0)
+            render_sat_info_panel(g_ren, g_selected_sat, g_sats);
     }
+
+    if (g_show_help) render_help_overlay(g_ren);
 
     if (g_recording) video_frame(g_ren);
     SDL_RenderPresent(g_ren);

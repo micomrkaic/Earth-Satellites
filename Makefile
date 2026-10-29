@@ -2,14 +2,22 @@
 # Targets:
 #   make             → native binary   ./earth_orbit
 #   make run         → build + launch  (native)
+#   make install     → install binary + man page to ~/.local (or PREFIX=…)
+#   make uninstall   → remove installed files
 #   make wasm        → WASM build      ./web/index.html
 #   make serve       → local test server for WASM
-#   make clean       → remove binaries
-#   make distclean   → remove binaries, map_data.h, cached tarball
+#   make pages       → copy WASM build to docs/ (for GitHub Pages)
+#   make zip         → create earth_orbit_web.zip for itch.io
+#   make clean       → remove binaries and web/
+#   make distclean   → also remove map_data.h and cached tarball
 
 CC      ?= gcc
 EMCC    ?= emcc
 PYTHON  ?= python3
+
+PREFIX  ?= $(HOME)/.local
+BINDIR   = $(PREFIX)/bin
+MANDIR   = $(PREFIX)/share/man/man6
 
 CFLAGS_NATIVE  = -O2 -std=c17 $(shell sdl2-config --cflags)
 LIBS_NATIVE    = $(shell sdl2-config --libs) -lm
@@ -20,6 +28,7 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
                  -s ENVIRONMENT=web \
                  -s SINGLE_FILE=0 \
                  -s ASSERTIONS=0 \
+                 -s MINIFY_HTML=0 \
                  --shell-file shell.html
 
 SRC      = earth_orbit.c
@@ -57,9 +66,31 @@ serve:
 	cd $(WEB_DIR) && $(PYTHON) -m http.server 8080
 
 .PHONY: zip
-zip:
+zip: wasm
 	cd $(WEB_DIR) && zip ../earth_orbit_web.zip index.html index.js *.wasm
 	@echo "Created earth_orbit_web.zip — upload to itch.io"
+
+# ── Install / uninstall (native binary + man page) ───────────────────────────
+.PHONY: install
+install: $(BIN)
+	install -Dm755 $(BIN)          $(BINDIR)/$(BIN)
+	install -Dm644 earth_orbit.6   $(MANDIR)/earth_orbit.6
+	@echo "Installed binary : $(BINDIR)/$(BIN)"
+	@echo "Installed man page: $(MANDIR)/earth_orbit.6"
+	@echo "Ensure $(BINDIR) is in PATH and $(PREFIX)/share/man is in MANPATH."
+
+.PHONY: uninstall
+uninstall:
+	rm -f $(BINDIR)/$(BIN)
+	rm -f $(MANDIR)/earth_orbit.6
+	@echo "Uninstalled."
+
+# ── GitHub Pages: copy WASM build to docs/ ───────────────────────────────────
+.PHONY: pages
+pages: wasm
+	mkdir -p docs
+	cp $(WEB_DIR)/index.html $(WEB_DIR)/index.js $(WEB_DIR)/*.wasm docs/
+	@echo "docs/ is ready — commit it and enable GitHub Pages (main branch, /docs)."
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
 .PHONY: clean
