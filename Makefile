@@ -36,12 +36,13 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
 # the wasm into the JS as base64.  Larger download but no CORS/MIME issues.
 CFLAGS_PAGES   = -O2 -std=gnu17 \
                  -s USE_SDL=2 \
-                 -s ALLOW_MEMORY_GROWTH=1 \
-                 -s INITIAL_MEMORY=67108864 \
+                 -s ALLOW_MEMORY_GROWTH=0 \
+                 -s INITIAL_MEMORY=134217728 \
                  -s ENVIRONMENT=web \
                  -s SINGLE_FILE=1 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
+                 -s EXPORTED_FUNCTIONS="['_main']" \
                  --shell-file shell.html
 
 SRC      = earth_orbit.c
