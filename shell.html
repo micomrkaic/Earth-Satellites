@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Earth Satellite Orbit Simulation</title>
+  <link rel="icon" href="data:,">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -47,27 +48,25 @@
   </div>
 
   <script>
-    /* ── TextDecoder polyfill for emcc 6.x ─────────────────────────────
-       emcc 6 creates WebAssembly.Memory with a `maximum` field even for
-       fixed-size builds.  Per the Wasm spec that makes .buffer a bounded-
-       resizable ArrayBuffer, which TextDecoder.decode() refuses.
-       Copy to a plain non-resizable ArrayBuffer before decoding.        */
+    /* ── Disable resizable Wasm heap (emcc 6.0.2 GROWABLE_ARRAYBUFFERS=1) ──
+       emcc 6.0.2's runtime does `try { wasmMemory.toResizableBuffer() }
+       catch {}` and otherwise falls back to the classic fixed-length
+       wasmMemory.buffer.  A resizable heap breaks TextDecoder.decode(),
+       WebGL texSubImage2D, and other Web APIs that reject resizable views.
+       Making the method throw forces the safe fallback regardless of the
+       emcc version or build flags used.  (Also fixed via
+       -sGROWABLE_ARRAYBUFFERS=0 in the Makefile; upstream reverted the
+       default in 6.0.3.)                                                  */
     (function () {
-      var _decode = TextDecoder.prototype.decode;
-      TextDecoder.prototype.decode = function (input, opts) {
-        if (input != null) {
-          var buf = ArrayBuffer.isView(input) ? input.buffer : input;
-          if (buf instanceof ArrayBuffer && buf.resizable) {
-            if (ArrayBuffer.isView(input)) {
-              input = input.buffer.slice(input.byteOffset,
-                                         input.byteOffset + input.byteLength);
-            } else {
-              input = input.slice(0);
-            }
-          }
+      try {
+        var P = WebAssembly.Memory.prototype;
+        if ('toResizableBuffer' in P) {
+          Object.defineProperty(P, 'toResizableBuffer', {
+            value: function () { throw new TypeError('toResizableBuffer disabled'); },
+            configurable: true, writable: true
+          });
         }
-        return _decode.call(this, input, opts);
-      };
+      } catch (e) {}
     })();
 
     /* ── Key map: physical key code → SDL keycode ──────────────────────

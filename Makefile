@@ -21,9 +21,15 @@ MANDIR   = $(PREFIX)/share/man/man6
 
 CFLAGS_NATIVE  = -O2 -std=c17 $(shell sdl2-config --cflags)
 LIBS_NATIVE    = $(shell sdl2-config --libs) -lm
+# GROWABLE_ARRAYBUFFERS=0 is essential on emcc 6.0.2: that release defaulted
+# it to 1, making the runtime back HEAP* with a resizable ArrayBuffer via
+# wasmMemory.toResizableBuffer().  Chrome's TextDecoder/WebGL reject resizable
+# views ("ArrayBuffer value must not be resizable").  Upstream reverted the
+# default to 0 in 6.0.3 for exactly this reason.
 CFLAGS_WASM    = -O2 -std=gnu17 \
                  -s USE_SDL=2 \
                  -s ALLOW_MEMORY_GROWTH=1 \
+                 -s GROWABLE_ARRAYBUFFERS=0 \
                  -s INITIAL_MEMORY=67108864 \
                  -s ENVIRONMENT=web \
                  -s SINGLE_FILE=0 \
@@ -36,6 +42,7 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
 CFLAGS_PAGES   = -O2 -std=gnu17 \
                  -s USE_SDL=2 \
                  -s ALLOW_MEMORY_GROWTH=1 \
+                 -s GROWABLE_ARRAYBUFFERS=0 \
                  -s INITIAL_MEMORY=67108864 \
                  -s ENVIRONMENT=web \
                  -s SINGLE_FILE=1 \
