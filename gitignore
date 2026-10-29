@@ -1,0 +1,18 @@
+# Build output
+earth_orbit
+web/
+earth_orbit_web.zip
+
+# Generated header (reproducible from gen_map_data.py)
+map_data.h
+
+# Cached npm tarball
+world-atlas-*.tgz
+
+# Video captures
+*.mp4
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

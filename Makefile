@@ -73,8 +73,8 @@ zip: wasm
 # ── Install / uninstall (native binary + man page) ───────────────────────────
 .PHONY: install
 install: $(BIN)
-	install -Dm755 $(BIN)          $(BINDIR)/$(BIN)
-	install -Dm644 earth_orbit.6   $(MANDIR)/earth_orbit.6
+	install -Dm755 $(BIN)            $(BINDIR)/$(BIN)
+	install -Dm644 man/earth_orbit.6 $(MANDIR)/earth_orbit.6
 	@echo "Installed binary : $(BINDIR)/$(BIN)"
 	@echo "Installed man page: $(MANDIR)/earth_orbit.6"
 	@echo "Ensure $(BINDIR) is in PATH and $(PREFIX)/share/man is in MANPATH."
