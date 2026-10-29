@@ -1949,7 +1949,11 @@ int main(void) {
        Emscripten that makes SDL2 track CSS size changes and re-register its
        event listeners, which breaks keyboard input in the browser.           */
     SDL_Window *win = SDL_CreateWindow(
+#ifdef __EMSCRIPTEN__
+        "",   /* empty title avoids Emscripten TextDecoder/resizable-ArrayBuffer bug */
+#else
         "Earth Satellite Orbit Simulation",
+#endif
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         WIN_W, WIN_H,
         SDL_WINDOW_SHOWN
