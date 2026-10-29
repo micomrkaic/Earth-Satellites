@@ -30,19 +30,21 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
                  -s SINGLE_FILE=0 \
+                 -s TEXTDECODER=0 \
                  --shell-file shell.html
 
 # GitHub Pages can't serve .wasm with the correct MIME type, so we bake
 # the wasm into the JS as base64.  Larger download but no CORS/MIME issues.
 CFLAGS_PAGES   = -O2 -std=gnu17 \
                  -s USE_SDL=2 \
-                 -s ALLOW_MEMORY_GROWTH=0 \
-                 -s INITIAL_MEMORY=134217728 \
+                 -s ALLOW_MEMORY_GROWTH=1 \
+                 -s MAXIMUM_MEMORY=134217728 \
+                 -s INITIAL_MEMORY=67108864 \
                  -s ENVIRONMENT=web \
                  -s SINGLE_FILE=1 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
-                 -s EXPORTED_FUNCTIONS="['_main']" \
+                 -s TEXTDECODER=0 \
                  --shell-file shell.html
 
 SRC      = earth_orbit.c
