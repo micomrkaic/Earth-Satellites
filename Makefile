@@ -29,6 +29,19 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
                  -s SINGLE_FILE=0 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
+                 -s SINGLE_FILE=0 \
+                 --shell-file shell.html
+
+# GitHub Pages can't serve .wasm with the correct MIME type, so we bake
+# the wasm into the JS as base64.  Larger download but no CORS/MIME issues.
+CFLAGS_PAGES   = -O2 -std=gnu17 \
+                 -s USE_SDL=2 \
+                 -s ALLOW_MEMORY_GROWTH=1 \
+                 -s INITIAL_MEMORY=67108864 \
+                 -s ENVIRONMENT=web \
+                 -s SINGLE_FILE=1 \
+                 -s ASSERTIONS=0 \
+                 -s MINIFY_HTML=0 \
                  --shell-file shell.html
 
 SRC      = earth_orbit.c
@@ -73,8 +86,8 @@ zip: wasm
 # ── Install / uninstall (native binary + man page) ───────────────────────────
 .PHONY: install
 install: $(BIN)
-	install -Dm755 $(BIN)            $(BINDIR)/$(BIN)
-	install -Dm644 man/earth_orbit.6 $(MANDIR)/earth_orbit.6
+	install -Dm755 $(BIN)          $(BINDIR)/$(BIN)
+	install -Dm644 earth_orbit.6   $(MANDIR)/earth_orbit.6
 	@echo "Installed binary : $(BINDIR)/$(BIN)"
 	@echo "Installed man page: $(MANDIR)/earth_orbit.6"
 	@echo "Ensure $(BINDIR) is in PATH and $(PREFIX)/share/man is in MANPATH."
@@ -85,11 +98,15 @@ uninstall:
 	rm -f $(MANDIR)/earth_orbit.6
 	@echo "Uninstalled."
 
-# ── GitHub Pages: copy WASM build to docs/ ───────────────────────────────────
+# ── GitHub Pages: single-file build into docs/ (no .wasm MIME issues) ────────
 .PHONY: pages
-pages: wasm
+pages: $(MAP_DATA)
+	@command -v $(EMCC) >/dev/null 2>&1 || { \
+	    echo "ERROR: emcc not found.  Run:"; \
+	    echo "  source emsdk/emsdk_env.sh"; \
+	    exit 1; }
 	mkdir -p docs
-	cp $(WEB_DIR)/index.html $(WEB_DIR)/index.js $(WEB_DIR)/*.wasm docs/
+	$(EMCC) $(SRC) $(CFLAGS_PAGES) -o docs/index.html
 	@echo "docs/ is ready — commit it and enable GitHub Pages (main branch, /docs)."
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
