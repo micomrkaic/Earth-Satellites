@@ -47,6 +47,29 @@
   </div>
 
   <script>
+    /* ── TextDecoder polyfill for emcc 6.x ─────────────────────────────
+       emcc 6 creates WebAssembly.Memory with a `maximum` field even for
+       fixed-size builds.  Per the Wasm spec that makes .buffer a bounded-
+       resizable ArrayBuffer, which TextDecoder.decode() refuses.
+       Copy to a plain non-resizable ArrayBuffer before decoding.        */
+    (function () {
+      var _decode = TextDecoder.prototype.decode;
+      TextDecoder.prototype.decode = function (input, opts) {
+        if (input != null) {
+          var buf = ArrayBuffer.isView(input) ? input.buffer : input;
+          if (buf instanceof ArrayBuffer && buf.resizable) {
+            if (ArrayBuffer.isView(input)) {
+              input = input.buffer.slice(input.byteOffset,
+                                         input.byteOffset + input.byteLength);
+            } else {
+              input = input.slice(0);
+            }
+          }
+        }
+        return _decode.call(this, input, opts);
+      };
+    })();
+
     /* ── Key map: physical key code → SDL keycode ──────────────────────
        C polls window._wk each frame via EM_ASM_INT.  No C function call
        from JS required — eliminates all export/scope issues entirely.   */
