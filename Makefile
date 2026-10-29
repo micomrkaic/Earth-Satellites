@@ -29,8 +29,7 @@ CFLAGS_WASM    = -O2 -std=gnu17 \
                  -s SINGLE_FILE=0 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
-                 -s SINGLE_FILE=0 \
-                 -s TEXTDECODER=0 \
+                 -s TEXTDECODER=2 \
                  --shell-file shell.html
 
 # GitHub Pages can't serve .wasm with the correct MIME type, so we bake
@@ -44,7 +43,7 @@ CFLAGS_PAGES   = -O2 -std=gnu17 \
                  -s SINGLE_FILE=1 \
                  -s ASSERTIONS=0 \
                  -s MINIFY_HTML=0 \
-                 -s TEXTDECODER=0 \
+                 -s TEXTDECODER=2 \
                  --shell-file shell.html
 
 SRC      = earth_orbit.c
