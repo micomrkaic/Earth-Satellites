@@ -14,9 +14,13 @@
       min-height: 100vh; padding: 8px;
     }
     #canvas-container { position: relative; width: 100%; max-width: 1200px; }
+    /* The C side sizes the back-buffer to this element's physical pixel
+       width (CSS px × devicePixelRatio) and then sets the CSS width/height
+       inline via _fitCss(), so every device pixel maps 1:1 — no browser
+       resampling in either direction.  width:100% is only the pre-init
+       default; SDL detects the external CSS sizing and leaves it alone.  */
     canvas {
       display: block; width: 100%; height: auto;
-      image-rendering: pixelated; image-rendering: crisp-edges;
       border: 1px solid #111;
     }
     #loading {
@@ -92,7 +96,31 @@
       }
     }, true);
 
-    var canvas = document.getElementById('canvas');
+    var canvas    = document.getElementById('canvas');
+    var container = document.getElementById('canvas-container');
+
+    /* ── Device-pixel sizing ──────────────────────────────────────────
+       Measure the container in physical pixels; C reads window._devW at
+       start-up (and polls it each frame) and sizes the back-buffer to it.
+       It then calls _fitCss(W,H) with the exact buffer size so the CSS
+       size is W/dpr — a 1:1 device-pixel mapping, hence crisp output at
+       any zoom level or devicePixelRatio.                               */
+    function measureDev() {
+      var dpr = window.devicePixelRatio || 1;
+      window._devW = Math.round(container.clientWidth * dpr);
+    }
+    measureDev();
+    var _rt = null;
+    window.addEventListener('resize', function() {
+      clearTimeout(_rt);
+      _rt = setTimeout(measureDev, 200);   /* debounce: rebuilds textures */
+    });
+    window._fitCss = function(W, H) {
+      var dpr = window.devicePixelRatio || 1;
+      var w = Math.min(container.clientWidth, W / dpr);
+      canvas.style.width  = w + 'px';
+      canvas.style.height = (w * H / W) + 'px';
+    };
 
     /* Keep canvas focused for SDL2's own mouse/scroll handling          */
     canvas.addEventListener('mousedown', function() { canvas.focus(); });

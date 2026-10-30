@@ -113,6 +113,38 @@ The TLE is parsed on the fly; mean motion is converted to a semi\-major axis
 via the vis\-viva relation.
 .SS Touch (WebAssembly)
 Single\-finger drag rotates the globe; two\-finger pinch zooms.
+.SH DISPLAY SCALING
+The scene is laid out in a fixed 1200×780 logical space, but the
+back\-buffer is sized to the display's physical pixels and everything
+(vector work, bitmap font, globe and map textures) is rasterised at that
+resolution, so output is pixel\-crisp at any window size or
+device\-pixel\-ratio.
+In the browser the size follows the page automatically, including on
+resize and zoom.
+On the desktop it defaults to 1× and is overridden with
+.BR EARTH_ORBIT_SCALE .
+.SH ENVIRONMENT
+.TP
+.B EARTH_ORBIT_SCALE
+Desktop only.
+Render scale factor (0.5\(en3.0); e.g.
+.B EARTH_ORBIT_SCALE=2
+gives a 2400×1560 window for HiDPI displays or large video captures.
+.TP
+.B EARTH_ORBIT_SNAPSHOT
+Desktop only.
+Path of a BMP file: the simulation pauses, renders 30 frames, saves the
+frame and exits.
+Combine with
+.B SDL_VIDEODRIVER=dummy
+for a fully headless render.
+.TP
+.B EARTH_ORBIT_SNAPSHOT_KEYS
+Keys to press before the snapshot, e.g.
+.B p
+for the map view or
+.B h
+for the help overlay.
 .SH FILES
 .TP
 .I map_data.h

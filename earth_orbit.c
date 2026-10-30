@@ -43,6 +43,24 @@
 #define CX        480
 #define CY        390
 #define BASE_R    270.0
+
+/* ── Device resolution ───────────────────────────────────────────────────
+   The whole scene is laid out in a fixed WIN_W×WIN_H *logical* space.
+   The back-buffer, however, is sized to the display's physical pixels
+   (CSS size × devicePixelRatio in the browser) and the renderer is given
+   SDL_RenderSetScale(g_scale, g_scale).  Vector primitives therefore
+   rasterise in device pixels and stay continuous at any scale; the three
+   things that do not survive a render scale — the bitmap font, point
+   markers, and the software-rendered globe/map textures — are generated
+   directly in device space.  g_scale == 1 reproduces the classic output
+   pixel-for-pixel.                                                        */
+static double g_scale = 1.0;            /* device px per logical px      */
+static int    g_W     = WIN_W;          /* back-buffer size, device px   */
+static int    g_H     = WIN_H;
+static SDL_Window *g_win = NULL;
+
+/* Convert a logical coordinate to the nearest device pixel. */
+static inline int dev(double v) { return (int)lround(v * g_scale); }
 #define ZOOM_INIT   0.15
 #define ZOOM_MIN    0.04
 #define ZOOM_MAX    8.0
@@ -79,7 +97,7 @@
 /* ======================================================================
    5×7 bitmap font
    ====================================================================== */
-static const uint8_t FONT[59][7] = {
+static const uint8_t FONT[62][7] = {
 /* 32 ' ' */{0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 /* 33 '!' */{0x04,0x04,0x04,0x04,0x04,0x00,0x04},
 /* 34 '"' */{0x0A,0x0A,0x00,0x00,0x00,0x00,0x00},
@@ -139,27 +157,148 @@ static const uint8_t FONT[59][7] = {
 /* 88 'X' */{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
 /* 89 'Y' */{0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
 /* 90 'Z' */{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
+/* 91 '[' */{0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
+/* 92 '\\' */{0x00,0x10,0x08,0x04,0x02,0x01,0x00},
+/* 93 ']' */{0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
 };
+
+/* ── Device-resolution glyph atlas ──────────────────────────────────────
+   Glyphs are pre-rasterised once per (font scale, g_scale) into a white
+   alpha texture at *device* resolution, with exact box-filter coverage:
+   each device pixel's alpha is the fraction of its area covered by lit
+   font cells.  At integer g_scale coverage is exactly 0 or 1, so the text
+   is pixel-crisp and identical to the old FillRect renderer at g_scale=1.
+   At fractional scales strokes get correctly-weighted edges instead of
+   randomly dropped or doubled columns.  Text is blitted with the render
+   scale temporarily reset to 1 so glyph pixels map 1:1 onto the display. */
+#define FONT_NGLYPH   62      /* ASCII 32..93                          */
+#define FONT_MAXSC     3      /* logical font scales 1..3 are supported */
+static SDL_Texture *g_font_tex = NULL;
+static SDL_Rect     g_font_rc[FONT_MAXSC][FONT_NGLYPH];
+
+static double seg_overlap(double a0, double a1, double b0, double b1) {
+    double lo = a0 > b0 ? a0 : b0, hi = a1 < b1 ? a1 : b1;
+    return hi > lo ? hi - lo : 0.0;
+}
+
+static void font_build(SDL_Renderer *ren) {
+    if (g_font_tex) { SDL_DestroyTexture(g_font_tex); g_font_tex = NULL; }
+
+    int gw[FONT_MAXSC], gh[FONT_MAXSC], row_y[FONT_MAXSC];
+    int tw = 0, th = 0;
+    for (int s = 0; s < FONT_MAXSC; s++) {
+        double cell = (s+1) * g_scale;
+        gw[s] = (int)ceil(5.0*cell - 1e-9);
+        gh[s] = (int)ceil(7.0*cell - 1e-9);
+        row_y[s] = th;
+        th += gh[s] + 1;
+        if (FONT_NGLYPH * (gw[s] + 1) > tw) tw = FONT_NGLYPH * (gw[s] + 1);
+    }
+
+    uint32_t *buf = calloc((size_t)tw * th, sizeof *buf);
+    if (!buf) return;
+
+    for (int s = 0; s < FONT_MAXSC; s++) {
+        double cell = (s+1) * g_scale;
+        for (int g = 0; g < FONT_NGLYPH; g++) {
+            const uint8_t *gl = FONT[g];
+            int x0 = g * (gw[s] + 1), y0 = row_y[s];
+            g_font_rc[s][g] = (SDL_Rect){x0, y0, gw[s], gh[s]};
+            for (int j = 0; j < gh[s]; j++) {
+                for (int i = 0; i < gw[s]; i++) {
+                    double cov = 0.0;
+                    for (int row = 0; row < 7; row++) {
+                        double oy = seg_overlap(j, j+1, row*cell, (row+1)*cell);
+                        if (oy <= 0.0) continue;
+                        for (int col = 0; col < 5; col++) {
+                            if (!(gl[row] & (0x10 >> col))) continue;
+                            double ox = seg_overlap(i, i+1, col*cell, (col+1)*cell);
+                            cov += ox * oy;
+                        }
+                    }
+                    if (cov > 1.0) cov = 1.0;
+                    uint32_t a = (uint32_t)(cov * 255.0 + 0.5);
+                    buf[(size_t)(y0+j) * tw + x0 + i] = (a << 24) | 0x00FFFFFF;
+                }
+            }
+        }
+    }
+
+    g_font_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                   SDL_TEXTUREACCESS_STATIC, tw, th);
+    if (g_font_tex) {
+        SDL_UpdateTexture(g_font_tex, NULL, buf, tw * 4);
+        SDL_SetTextureBlendMode(g_font_tex, SDL_BLENDMODE_BLEND);
+    }
+    free(buf);
+}
+
+/* Blit one glyph; caller has already set render scale to 1. */
+static void draw_char_dev(SDL_Renderer *ren, int x, int y, char c, int sc)
+{
+    if (c >= 'a' && c <= 'z') c -= 32;      /* font is uppercase-only */
+    if (c < 32 || c > 93 || !g_font_tex) return;
+    int s = sc < 1 ? 0 : (sc > FONT_MAXSC ? FONT_MAXSC-1 : sc-1);
+    const SDL_Rect *src = &g_font_rc[s][(uint8_t)(c - 32)];
+    SDL_Rect dst = { dev(x), dev(y), src->w, src->h };
+    SDL_RenderCopy(ren, g_font_tex, src, &dst);
+}
 
 static void draw_char(SDL_Renderer *ren, int x, int y, char c,
                       uint8_t r, uint8_t g, uint8_t b, int sc)
 {
-    if (c < 32 || c > 90) return;
-    const uint8_t *gl = FONT[(uint8_t)(c - 32)];
-    SDL_SetRenderDrawColor(ren, r, g, b, 255);
-    for (int row = 0; row < 7; row++)
-        for (int col = 0; col < 5; col++)
-            if (gl[row] & (0x10 >> col)) {
-                SDL_Rect rc = {x + col*sc, y + row*sc, sc, sc};
-                SDL_RenderFillRect(ren, &rc);
-            }
+    if (!g_font_tex) return;
+    SDL_SetTextureColorMod(g_font_tex, r, g, b);
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    draw_char_dev(ren, x, y, c, sc);
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
 }
 
 static void draw_str(SDL_Renderer *ren, int x, int y, const char *s,
                      uint8_t r, uint8_t g, uint8_t b, int sc)
 {
-    for (; *s; s++, x += 6*sc)
-        draw_char(ren, x, y, *s, r, g, b, sc);
+    if (!g_font_tex) return;
+    SDL_SetTextureColorMod(g_font_tex, r, g, b);
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    /* Advance in logical units and convert per glyph, so spacing follows
+       the layout exactly rather than accumulating rounding error.        */
+    for (int i = 0; *s; s++, i++)
+        draw_char_dev(ren, x + 6*sc*i, y, *s, sc);
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
+}
+
+/* ── Device-aware primitives ────────────────────────────────────────────
+   Points and lines are rasterised directly in device space with an
+   integer stroke weight of round(g_scale) pixels.  Leaving them to SDL's
+   render scale is wrong in both directions: below 1× its g_scale-sized
+   dabs shrink under a pixel and get dropped (the dashing this work
+   removes), and at non-integer scales ≥ 1 they alternate between 1 and 2
+   px and look beaded.  Device-space Bresenham is continuous and uniform
+   at every scale, and identical to the original output at 1×.           */
+static inline int stroke_px(void) {
+    int t = (int)lround(g_scale);
+    return t < 1 ? 1 : t;
+}
+
+static inline void put_px(SDL_Renderer *ren, int x, int y) {
+    int t = stroke_px();
+    SDL_Rect r = { dev(x) - t/2, dev(y) - t/2, t, t };
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    SDL_RenderFillRect(ren, &r);
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
+}
+
+static inline void dline(SDL_Renderer *ren, int x0, int y0, int x1, int y1) {
+    int X0 = dev(x0), Y0 = dev(y0), X1 = dev(x1), Y1 = dev(y1);
+    int t  = stroke_px();
+    int steep = abs(Y1 - Y0) > abs(X1 - X0);   /* thicken across the minor axis */
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    for (int k = 0; k < t; k++) {
+        int o = k - t/2;
+        if (steep) SDL_RenderDrawLine(ren, X0 + o, Y0, X1 + o, Y1);
+        else       SDL_RenderDrawLine(ren, X0, Y0 + o, X1, Y1 + o);
+    }
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
 }
 
 /* ======================================================================
@@ -615,7 +754,7 @@ static void render_footprint_3d(SDL_Renderer *ren, V3 pos,
         int occ1 = occluded(p1, Rpx);
         SDL_SetRenderDrawColor(ren, cr, cg, cb,
                                (uint8_t)((occ0 || occ1) ? 25 : 160));
-        SDL_RenderDrawLine(ren, px_x(p0,Rpx), px_y(p0,Rpx),
+        dline(ren, px_x(p0,Rpx), px_y(p0,Rpx),
                                 px_x(p1,Rpx), px_y(p1,Rpx));
     }
 }
@@ -640,7 +779,7 @@ static void render_footprint_map(SDL_Renderer *ren, V3 pos,
             double dlon = fabs(lon - prev_lon);
             if (dlon < PI) {
                 SDL_SetRenderDrawColor(ren, cr, cg, cb, 130);
-                SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+                dline(ren, prev_px, prev_py, mpx, mpy);
             }
         }
         prev_px=mpx; prev_py=mpy; prev_lon=lon;
@@ -659,10 +798,10 @@ static void render_gps_3d(SDL_Renderer *ren,
         if (sx<3||sx>=WIN_W-3||sy<3||sy>=WIN_H-3) continue;
         const OrbEl *e = gps_sats[i].el;
         SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 210);
-        SDL_RenderDrawLine(ren, sx-3, sy,   sx,   sy-3);
-        SDL_RenderDrawLine(ren, sx,   sy-3, sx+3, sy  );
-        SDL_RenderDrawLine(ren, sx+3, sy,   sx,   sy+3);
-        SDL_RenderDrawLine(ren, sx,   sy+3, sx-3, sy  );
+        dline(ren, sx-3, sy,   sx,   sy-3);
+        dline(ren, sx,   sy-3, sx+3, sy  );
+        dline(ren, sx+3, sy,   sx,   sy+3);
+        dline(ren, sx,   sy+3, sx-3, sy  );
     }
 }
 
@@ -688,30 +827,33 @@ static void render_gps_map(SDL_Renderer *ren, double earth_angle)
    Natural Earth precise line rendering into map_tex_buf
    ====================================================================== */
 
-/* These are needed by both the NE helpers and build_mercator_texture */
-static double   g_map_y_max;                    /* log(tan(π/4 + clip/2)) */
-static uint32_t map_tex_buf[WIN_H * WIN_W];     /* 3.7 MB in BSS          */
+/* These are needed by both the NE helpers and build_mercator_texture.
+   The map texture is rasterised at *device* resolution (g_mtw × g_mth ≈
+   MAP_W×g_scale by WIN_H×g_scale) so it is blitted 1:1 and never resampled. */
+static double    g_map_y_max;                   /* log(tan(π/4 + clip/2)) */
+static uint32_t *map_tex_buf = NULL;            /* g_mtw × g_mth, malloc'd */
+static int       g_mtw = MAP_W, g_mth = WIN_H;  /* map texture size, px    */
 
-/* Degrees → pixel (uses g_map_y_max, set before build_mercator_texture) */
+/* Degrees → device pixel (uses g_map_y_max, set before build_mercator_texture) */
 static int ne_lx(double lon_d) {
-    return (int)((lon_d + 180.0) / 360.0 * MAP_W);
+    return (int)((lon_d + 180.0) / 360.0 * g_mtw);
 }
 static int ne_ly(double lat_d) {
     if (lat_d >  82.0) lat_d =  82.0;
     if (lat_d < -82.0) lat_d = -82.0;
     double lr = lat_d * (PI/180.0);
     double y  = log(tan(PI/4.0 + lr/2.0));
-    return (int)((g_map_y_max - y) / (2.0*g_map_y_max) * WIN_H);
+    return (int)((g_map_y_max - y) / (2.0*g_map_y_max) * g_mth);
 }
 
-/* Bresenham line into map_tex_buf (texture stride = WIN_W) */
+/* Bresenham line into map_tex_buf (texture stride = g_mtw) */
 static void buf_line(int x0, int y0, int x1, int y1, uint32_t col) {
     int dx = abs(x1-x0), dy = abs(y1-y0);
     int sx = x0<x1 ? 1 : -1, sy = y0<y1 ? 1 : -1;
     int err = dx-dy, imax = dx+dy+2;
     for (int i=0; i<imax; i++) {
-        if (x0>=0 && x0<MAP_W && y0>=0 && y0<WIN_H)
-            map_tex_buf[y0*WIN_W + x0] = col;
+        if (x0>=0 && x0<g_mtw && y0>=0 && y0<g_mth)
+            map_tex_buf[(size_t)y0*g_mtw + x0] = col;
         if (x0==x1 && y0==y1) break;
         int e2=err*2;
         if (e2>-dy) { err-=dy; x0+=sx; }
@@ -720,10 +862,11 @@ static void buf_line(int x0, int y0, int x1, int y1, uint32_t col) {
 }
 
 /* Draw a Natural Earth polyline dataset into the texture buffer.
-   thick=1 draws a second row offset +1 in y for 2-pixel coastlines. */
+   `rows` is the stroke weight in device pixels: each extra row is drawn
+   offset +1 in y (1 row = hairline borders, 2 rows = coastlines at 1×). */
 static void draw_ne_lines(const float pts[][2],
                            const int *starts, const int *lens, int npolys,
-                           uint32_t col, int thick)
+                           uint32_t col, int rows)
 {
     for (int i=0; i<npolys; i++) {
         const float (*line)[2] = pts + starts[i];
@@ -734,8 +877,8 @@ static void draw_ne_lines(const float pts[][2],
             if (fabs(lon1-lon0) > 180.0) continue;   /* antimeridian break */
             int x0=ne_lx(lon0), y0=ne_ly(lat0);
             int x1=ne_lx(lon1), y1=ne_ly(lat1);
-            buf_line(x0, y0,   x1, y1,   col);
-            if (thick) buf_line(x0, y0+1, x1, y1+1, col);
+            for (int t=0; t<rows; t++)
+                buf_line(x0, y0+t, x1, y1+t, col);
         }
     }
 }
@@ -763,14 +906,21 @@ static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
     const uint32_t C_GRID    = 0xFF0E1C30;   /* dim 30° grid             */
     const uint32_t C_GRID_EQ = 0xFF162840;   /* equator / prime meridian */
 
-    for (int py = 0; py < WIN_H; py++) {
-        double ym      = g_map_y_max * (1.0 - 2.0*py / (double)WIN_H);
+    g_mtw = dev(MAP_W);
+    g_mth = dev(WIN_H);
+    free(map_tex_buf);
+    map_tex_buf = malloc((size_t)g_mtw * g_mth * sizeof *map_tex_buf);
+    if (!map_tex_buf) return NULL;
+
+    /* Grid-line widths are in degrees, so they scale with the texture.   */
+    for (int py = 0; py < g_mth; py++) {
+        double ym      = g_map_y_max * (1.0 - 2.0*py / (double)g_mth);
         double lat     = 2.0*atan(exp(ym)) - PI/2.0;
         double lat_deg = lat * (180.0/PI);
         double la30    = fmod(fabs(lat_deg), 30.0);
 
-        for (int px = 0; px < MAP_W; px++) {
-            double lon   = ((double)px / (double)MAP_W) * 2.0*PI - PI;
+        for (int px = 0; px < g_mtw; px++) {
+            double lon   = ((double)px / (double)g_mtw) * 2.0*PI - PI;
             double lo_d  = lon * (180.0/PI);
             double lo30  = fmod(lo_d < 0 ? lo_d + 360.0 : lo_d, 30.0);
 
@@ -782,22 +932,24 @@ static SDL_Texture *build_mercator_texture(SDL_Renderer *ren) {
             if      (on_eq || on_pm) col = C_GRID_EQ;
             else if (on_grid)        col = C_GRID;
 
-            map_tex_buf[py * WIN_W + px] = col;
+            map_tex_buf[(size_t)py * g_mtw + px] = col;
         }
     }
 
     /* ── Overlay precise Natural Earth coastlines + country borders ── */
+    int rows_border = (int)lround(1.0 * g_scale); if (rows_border < 1) rows_border = 1;
+    int rows_coast  = (int)lround(2.0 * g_scale); if (rows_coast  < 1) rows_coast  = 1;
     /* Country borders first (dimmer, underneath coastlines) */
     draw_ne_lines(border_pts, border_start, border_len, BORDER_NPOLYS,
-                  0xFF2A6835, 0);   /* dim green, 1 px */
-    /* Coastlines on top — 2 px wide, brighter green */
+                  0xFF2A6835, rows_border);   /* dim green, 1 px at 1×    */
+    /* Coastlines on top — brighter green */
     draw_ne_lines(coast_pts,  coast_start,  coast_len,  COAST_NPOLYS,
-                  0xFF55D060, 1);   /* bright green, 2 px */
+                  0xFF55D060, rows_coast);    /* bright green, 2 px at 1× */
 
     SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                                          SDL_TEXTUREACCESS_STATIC, WIN_W, WIN_H);
+                                          SDL_TEXTUREACCESS_STATIC, g_mtw, g_mth);
     if (!tex) return NULL;
-    SDL_UpdateTexture(tex, NULL, map_tex_buf, WIN_W*4);
+    SDL_UpdateTexture(tex, NULL, map_tex_buf, g_mtw*4);
     return tex;
 }
 
@@ -812,10 +964,13 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
                              int recording,
                              uint32_t frame_count)
 {
-    /* Background map — blit only into the map area, not under the panel */
-    SDL_Rect map_dest = {0, 0, MAP_W, WIN_H};
-    SDL_Rect map_src  = {0, 0, MAP_W, WIN_H};
-    SDL_RenderCopy(ren, map_tex, &map_src, &map_dest);
+    /* Background map — the texture is already at device resolution, so
+       blit it 1:1 with the render scale reset (no resampling).  It covers
+       exactly the map area; the panel sits to its right.                  */
+    SDL_Rect map_dest = {0, 0, g_mtw, g_mth};
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    SDL_RenderCopy(ren, map_tex, NULL, &map_dest);
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
@@ -853,7 +1008,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
                             (uint8_t)(s->el->cg * (0.4f + 0.6f*age)),
                             (uint8_t)(s->el->cb * (0.4f + 0.6f*age)),
                             alpha);
-                        SDL_RenderDrawLine(ren, prev_px, prev_py, mpx, mpy);
+                        dline(ren, prev_px, prev_py, mpx, mpy);
                     }
                 }
             }
@@ -885,7 +1040,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         for (int dy=-6; dy<=6; dy++)
             for (int dx=-6; dx<=6; dx++)
                 if (dx*dx+dy*dy<=36)
-                    SDL_RenderDrawPoint(ren, mpx+dx, mpy+dy);
+                    put_px(ren, mpx+dx, mpy+dy);
 
         /* Filled circle (radius 4) */
         SDL_SetRenderDrawColor(ren, e->cr, e->cg, e->cb, 255);
@@ -893,17 +1048,17 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         for (int dy=-4; dy<=4; dy++)
             for (int dx=-4; dx<=4; dx++)
                 if (dx*dx+dy*dy<=16)
-                    SDL_RenderDrawPoint(ren, mpx+dx, mpy+dy);
+                    put_px(ren, mpx+dx, mpy+dy);
 
         /* Crosshair extending outward */
-        SDL_RenderDrawLine(ren, mpx-9, mpy,  mpx-5, mpy);
-        SDL_RenderDrawLine(ren, mpx+5, mpy,  mpx+9, mpy);
-        SDL_RenderDrawLine(ren, mpx, mpy-9,  mpx, mpy-5);
-        SDL_RenderDrawLine(ren, mpx, mpy+5,  mpx, mpy+9);
+        dline(ren, mpx-9, mpy,  mpx-5, mpy);
+        dline(ren, mpx+5, mpy,  mpx+9, mpy);
+        dline(ren, mpx, mpy-9,  mpx, mpy-5);
+        dline(ren, mpx, mpy+5,  mpx, mpy+9);
 
         /* White centre dot */
         SDL_SetRenderDrawColor(ren,255,255,255,255);
-        SDL_RenderDrawPoint(ren, mpx, mpy);
+        put_px(ren, mpx, mpy);
 
         /* Name label — place right of dot, flip left if near right edge */
         int lx = (mpx + WIN_W - 196 > WIN_W - 210) ? mpx - 6*((int)strlen(e->name)+1) - 2
@@ -945,7 +1100,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         }
         /* tick line */
         SDL_SetRenderDrawColor(ren, 50,80,60, 200);
-        SDL_RenderDrawLine(ren, 0, py, MAP_W, py);
+        dline(ren, 0, py, MAP_W, py);
         draw_str(ren, 3, py-4, buf, 70,110,70, 1);
     }
     /* Longitude labels on bottom edge */
@@ -956,7 +1111,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
         if (ppx < 0 || ppx >= MAP_W) continue;
         char buf[8]; snprintf(buf,sizeof(buf),"%d",lon_ticks[t]);
         SDL_SetRenderDrawColor(ren, 50,80,60, 200);
-        SDL_RenderDrawLine(ren, ppx, 0, ppx, WIN_H-28);
+        dline(ren, ppx, 0, ppx, WIN_H-28);
         draw_str(ren, ppx-12, WIN_H-44, buf, 70,110,70, 1);
     }
 
@@ -974,7 +1129,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
 
     /* Separator line */
     SDL_SetRenderDrawColor(ren, 40,80,50, 255);
-    SDL_RenderDrawLine(ren, WIN_W-200, 0, WIN_W-200, WIN_H);
+    dline(ren, WIN_W-200, 0, WIN_W-200, WIN_H);
 
     draw_str(ren, WIN_W-196, 8,  "SATELLITE POSITIONS", 60,160,80, 1);
     draw_str(ren, WIN_W-196, 20, "-------------------", 30,70,40, 1);
@@ -1016,7 +1171,7 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
 
     /* Divider before status */
     SDL_SetRenderDrawColor(ren, 30,60,40, 200);
-    SDL_RenderDrawLine(ren, WIN_W-196, legend_y+2, WIN_W-4, legend_y+2);
+    dline(ren, WIN_W-196, legend_y+2, WIN_W-4, legend_y+2);
     legend_y += 8;
 
     /* J2 / GPS / FP status */
@@ -1059,21 +1214,24 @@ static void render_map_view(SDL_Renderer *ren, SDL_Texture *map_tex,
 /* ======================================================================
    Earth sphere rendering (per-pixel raycast, streaming texture)
    ====================================================================== */
-static void render_earth(uint32_t *px, int stride,
-                          double Rpx, double view_yaw, double view_pitch,
+/* Software-shade the globe into a W×H device-resolution buffer.
+   cx, cy, Rpx are in device pixels (caller multiplies by g_scale).      */
+static void render_earth(uint32_t *px, int stride, int W, int H,
+                          double cx, double cy, double Rpx,
+                          double view_yaw, double view_pitch,
                           double earth_angle)
 {
-    int iy0=(int)(CY-Rpx-2), iy1=(int)(CY+Rpx+2);
-    int ix0=(int)(CX-Rpx-2), ix1=(int)(CX+Rpx+2);
-    if (iy0<0)      iy0=0;
-    if (iy1>=WIN_H) iy1=WIN_H-1;
-    if (ix0<0)      ix0=0;
-    if (ix1>=WIN_W) ix1=WIN_W-1;
+    int iy0=(int)(cy-Rpx-2), iy1=(int)(cy+Rpx+2);
+    int ix0=(int)(cx-Rpx-2), ix1=(int)(cx+Rpx+2);
+    if (iy0<0)  iy0=0;
+    if (iy1>=H) iy1=H-1;
+    if (ix0<0)  ix0=0;
+    if (ix1>=W) ix1=W-1;
 
     for (int py=iy0; py<=iy1; py++) {
-        double ndy=(CY-py)/Rpx;
+        double ndy=(cy-py)/Rpx;
         for (int pxx=ix0; pxx<=ix1; pxx++) {
-            double ndx=(pxx-CX)/Rpx, r2=ndx*ndx+ndy*ndy;
+            double ndx=(pxx-cx)/Rpx, r2=ndx*ndx+ndy*ndy;
             uint32_t pixel=0xFF000000;
 
             if (r2<=1.0) {
@@ -1113,21 +1271,59 @@ static void render_earth(uint32_t *px, int stride,
 /* ======================================================================
    Orbit path (analytical Keplerian ellipse)
    ====================================================================== */
+/* Draw a device-space polyline with stroke weight round(g_scale).  Using
+   SDL_RenderDrawLines (rather than one call per segment) matters with
+   alpha blending: SDL draws each interior joint once, whereas per-segment
+   calls paint every shared endpoint twice and leave a bright dot at each
+   vertex.  Thickness copies are offset across each segment's minor axis. */
+static void dpolyline(SDL_Renderer *ren, const SDL_Point *p, int n)
+{
+    static SDL_Point tmp[ORBIT_PTS + 1];
+    if (n < 2) return;
+    int t = stroke_px();
+    SDL_RenderSetScale(ren, 1.0f, 1.0f);
+    for (int k = 0; k < t; k++) {
+        int o = k - t/2;
+        for (int i = 0; i < n; i++) {
+            /* Local direction over a ±8-point window: consecutive points are
+               often adjacent pixels, so a single segment's direction is too
+               noisy near 45° and would make the offset axis flip-flop.     */
+            int a = i - 8 < 0 ? 0 : i - 8, b = i + 8 > n-1 ? n-1 : i + 8;
+            int steep = abs(p[b].y - p[a].y) > abs(p[b].x - p[a].x);
+            tmp[i].x = p[i].x + (steep ? o : 0);
+            tmp[i].y = p[i].y + (steep ? 0 : o);
+        }
+        SDL_RenderDrawLines(ren, tmp, n);
+    }
+    SDL_RenderSetScale(ren, (float)g_scale, (float)g_scale);
+}
+
 static void render_orbit(SDL_Renderer *ren, const OrbEl *el,
                           double Rpx, double view_yaw, double view_pitch)
 {
+    static SDL_Point run[ORBIT_PTS + 1];
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    int psx=0,psy=0,pocc=0;
+    int n = 0, run_alpha = -1, pocc = 0;
     for (int j=0; j<=ORBIT_PTS; j++) {
         double nu=j*(2.0*PI/ORBIT_PTS);
         V3 pv=eci_to_view(orbit_pos_eci(el,nu),view_yaw,view_pitch);
-        int sx=px_x(pv,Rpx), sy=px_y(pv,Rpx), occ=occluded(pv,Rpx);
-        if (j>0) {
-            SDL_SetRenderDrawColor(ren,el->cr,el->cg,el->cb,(uint8_t)(occ&&pocc?40:130));
-            SDL_RenderDrawLine(ren,psx,psy,sx,sy);
+        int occ=occluded(pv,Rpx);
+        SDL_Point d = { dev(px_x(pv,Rpx)), dev(px_y(pv,Rpx)) };
+        /* Each pixel is now painted exactly once, so these alphas are set
+           to match the brightness the old per-segment overdraw produced. */
+        int alpha = (occ && pocc) ? 70 : 210;        /* segment j-1 → j */
+        if (j > 0 && alpha != run_alpha) {
+            /* Flush the previous run; the new run starts at its last point. */
+            SDL_SetRenderDrawColor(ren,el->cr,el->cg,el->cb,(uint8_t)run_alpha);
+            dpolyline(ren, run, n);
+            run[0] = run[n-1]; n = 1;
         }
-        psx=sx; psy=sy; pocc=occ;
+        if (n == 0 || d.x != run[n-1].x || d.y != run[n-1].y)
+            run[n++] = d;                            /* skip duplicate pixels */
+        run_alpha = alpha; pocc = occ;
     }
+    SDL_SetRenderDrawColor(ren,el->cr,el->cg,el->cb,(uint8_t)run_alpha);
+    dpolyline(ren, run, n);
 }
 
 /* ======================================================================
@@ -1151,7 +1347,7 @@ static void render_ground_tracks(SDL_Renderer *ren,
         V3 satv=eci_to_view(sats[i].pos,view_yaw,view_pitch);
         if (!occluded(satv,Rpx)) {
             SDL_SetRenderDrawColor(ren,e->cr,e->cg,e->cb,55);
-            SDL_RenderDrawLine(ren,px_x(satv,Rpx),px_y(satv,Rpx),gx,gy);
+            dline(ren,px_x(satv,Rpx),px_y(satv,Rpx),gx,gy);
         }
         SDL_SetRenderDrawColor(ren,e->cr,e->cg,e->cb,220);
         SDL_Rect outer={gx-3,gy-3,7,7}; SDL_RenderFillRect(ren,&outer);
@@ -1197,7 +1393,7 @@ static void render_satellite(SDL_Renderer *ren, const Sat *s,
             tb=(uint8_t)(s->el->cb*f);
         }
         SDL_SetRenderDrawColor(ren,tr,tg,tb,(uint8_t)(f*f*180));
-        SDL_RenderDrawPoint(ren,tsx,tsy);
+        put_px(ren,tsx,tsy);
     }
     V3 sv=eci_to_view(s->pos,view_yaw,view_pitch);
     if (occluded(sv,Rpx)) return;
@@ -1205,10 +1401,10 @@ static void render_satellite(SDL_Renderer *ren, const Sat *s,
     if (sx<4||sx>=WIN_W-4||sy<4||sy>=WIN_H-4) return;
     SDL_SetRenderDrawBlendMode(ren,SDL_BLENDMODE_NONE);
     SDL_SetRenderDrawColor(ren,s->el->cr,s->el->cg,s->el->cb,255);
-    SDL_RenderDrawLine(ren,sx-4,sy,sx+4,sy);
-    SDL_RenderDrawLine(ren,sx,sy-4,sx,sy+4);
-    SDL_RenderDrawLine(ren,sx-3,sy-3,sx+3,sy+3);
-    SDL_RenderDrawLine(ren,sx+3,sy-3,sx-3,sy+3);
+    dline(ren,sx-4,sy,sx+4,sy);
+    dline(ren,sx,sy-4,sx,sy+4);
+    dline(ren,sx-3,sy-3,sx+3,sy+3);
+    dline(ren,sx+3,sy-3,sx-3,sy+3);
     SDL_SetRenderDrawColor(ren,255,255,255,255);
     SDL_Rect dot={sx-1,sy-1,3,3}; SDL_RenderFillRect(ren,&dot);
 }
@@ -1245,18 +1441,18 @@ static void render_sun_indicator(SDL_Renderer *ren, double Rpx,
     for (int dy=-9; dy<=9; dy++)
         for (int dx=-9; dx<=9; dx++)
             if (dx*dx+dy*dy<=81)
-                SDL_RenderDrawPoint(ren, sx+dx, sy+dy);
+                put_px(ren, sx+dx, sy+dy);
     /* Core */
     SDL_SetRenderDrawColor(ren, 255, 220, 60, alpha);
     for (int dy=-3; dy<=3; dy++)
         for (int dx=-3; dx<=3; dx++)
             if (dx*dx+dy*dy<=9)
-                SDL_RenderDrawPoint(ren, sx+dx, sy+dy);
+                put_px(ren, sx+dx, sy+dy);
     /* Rays */
     SDL_SetRenderDrawColor(ren, 255, 220, 60, (uint8_t)(alpha*3/4));
     int rays[8][2]={{0,-8},{6,-6},{8,0},{6,6},{0,8},{-6,6},{-8,0},{-6,-6}};
     for (int r=0; r<8; r++)
-        SDL_RenderDrawLine(ren, sx+rays[r][0]/2, sy+rays[r][1]/2,
+        dline(ren, sx+rays[r][0]/2, sy+rays[r][1]/2,
                                 sx+rays[r][0],   sy+rays[r][1]);
     if (sv.z >= 0.0)
         draw_str(ren, sx+10, sy-4, "SUN", 255, 220, 60, 1);
@@ -1319,7 +1515,7 @@ static void render_help_overlay(SDL_Renderer *ren)
     SDL_RenderFillRect(ren, &full);
 
     /* Panel */
-    int pw = 560, ph = 360;
+    int pw = 560, ph = 236;
     int px = (WIN_W - pw) / 2, py = (WIN_H - ph) / 2;
     SDL_SetRenderDrawColor(ren, 10, 18, 30, 240);
     SDL_Rect panel = {px, py, pw, ph};
@@ -1451,23 +1647,28 @@ static void render_hud(SDL_Renderer *ren,
    ====================================================================== */
 #ifndef __EMSCRIPTEN__
 
-static FILE   *ffmpeg_pipe = NULL;
-static uint8_t frame_buf[WIN_W * WIN_H * 4];
+static FILE    *ffmpeg_pipe = NULL;
+static uint8_t *frame_buf   = NULL;   /* g_W × g_H × 3, allocated per recording */
+static int      frame_w = 0, frame_h = 0;
 
 static int video_start(void) {
     char fname[80], cmd[512];
     time_t t=time(NULL);
     struct tm *tm=localtime(&t);
     strftime(fname,sizeof(fname),"earth_orbit_%Y%m%d_%H%M%S.mp4",tm);
+    frame_w = g_W; frame_h = g_H;
+    free(frame_buf);
+    frame_buf = malloc((size_t)frame_w * frame_h * 3);
+    if (!frame_buf) { fprintf(stderr,"video_start: out of memory\n"); return 0; }
     snprintf(cmd,sizeof(cmd),
         "ffmpeg -y -f rawvideo -pixel_format rgb24 "
         "-video_size %dx%d -framerate 60 -i pipe:0 "
         "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "
         "'%s' 2>/dev/null",
-        WIN_W, WIN_H, fname);
+        frame_w, frame_h, fname);
     ffmpeg_pipe=popen(cmd,"w");
     if (!ffmpeg_pipe) { fprintf(stderr,"video_start: popen failed\n"); return 0; }
-    printf("Recording to: %s\n",fname);
+    printf("Recording to: %s (%dx%d)\n",fname,frame_w,frame_h);
     return 1;
 }
 
@@ -1479,8 +1680,9 @@ static void video_stop(void) {
 
 static void video_frame(SDL_Renderer *ren) {
     if (!ffmpeg_pipe) return;
-    SDL_RenderReadPixels(ren,NULL,SDL_PIXELFORMAT_RGB24,frame_buf,WIN_W*3);
-    fwrite(frame_buf,(size_t)WIN_W*WIN_H*3,1,ffmpeg_pipe);
+    if (g_W != frame_w || g_H != frame_h) return;   /* resized mid-recording */
+    SDL_RenderReadPixels(ren,NULL,SDL_PIXELFORMAT_RGB24,frame_buf,frame_w*3);
+    fwrite(frame_buf,(size_t)frame_w*frame_h*3,1,ffmpeg_pipe);
 }
 
 #else /* __EMSCRIPTEN__ — video capture not available in browser */
@@ -1715,6 +1917,93 @@ static void process_key(SDL_Keycode sym)
 }
 
 /* ======================================================================
+   Resolution management
+   ====================================================================== */
+#define SCALE_MIN 0.5     /* 600 px wide: phones in portrait            */
+#define SCALE_MAX 3.0     /* 3600 px: stays under common GL texture caps */
+
+/* Choose a back-buffer size for a requested device width.  Height follows
+   the logical aspect exactly; both are kept even (video encoders care).  */
+static void choose_resolution(int want_w, int *W, int *H) {
+    double s = (double)want_w / WIN_W;
+    if (s < SCALE_MIN) s = SCALE_MIN;
+    if (s > SCALE_MAX) s = SCALE_MAX;
+    *W = (int)lround(WIN_W * s) & ~1;
+    *H = (int)lround(WIN_H * s) & ~1;
+}
+
+/* (Re)create everything that depends on the back-buffer size.  Called once
+   at start-up and again whenever the browser reports a new device width.  */
+static int apply_resolution(int W, int H) {
+    g_W = W; g_H = H;
+    g_scale = (double)W / WIN_W;
+
+    int cw, ch;
+    SDL_GetWindowSize(g_win, &cw, &ch);
+    if (cw != W || ch != H) SDL_SetWindowSize(g_win, W, H);
+    SDL_RenderSetScale(g_ren, (float)g_scale, (float)g_scale);
+
+    if (g_earth_tex) SDL_DestroyTexture(g_earth_tex);
+    g_earth_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888,
+                                    SDL_TEXTUREACCESS_STREAMING, W, H);
+    if (!g_earth_tex) {
+        fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return 0;
+    }
+    if (g_map_tex) SDL_DestroyTexture(g_map_tex);
+    g_map_tex = build_mercator_texture(g_ren);
+    if (!g_map_tex) { fprintf(stderr, "build_mercator_texture failed\n"); return 0; }
+
+    font_build(g_ren);
+
+#ifdef __EMSCRIPTEN__
+    /* Tell the page the exact back-buffer size so it can set the canvas
+       CSS size to W/devicePixelRatio — a 1:1 device-pixel mapping.       */
+    EM_ASM({ if (window._fitCss) window._fitCss($0, $1); }, W, H);
+#endif
+    return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+static int g_last_devw = 0;
+/* Poll the device width the page measured (debounced in JS); re-apply the
+   resolution when it changes — browser resize, zoom, or a DPR change.    */
+static void poll_resize(void) {
+    int dw = EM_ASM_INT({ return (window._devW | 0); });
+    if (dw <= 0 || dw == g_last_devw) return;
+    g_last_devw = dw;
+    int W, H;
+    choose_resolution(dw, &W, &H);
+    if (W != g_W || H != g_H) apply_resolution(W, H);
+}
+#else
+/* Headless debugging aid (desktop only):
+     EARTH_ORBIT_SNAPSHOT=frame.bmp   pause, render ~30 frames, save, exit
+     EARTH_ORBIT_SNAPSHOT_KEYS=ph     keys to feed first (e.g. P map, H help)
+   Combine with SDL_VIDEODRIVER=dummy for a fully headless render.       */
+static void maybe_snapshot(void) {
+    static int frames = 0, checked = 0;
+    static const char *path = NULL;
+    if (!checked) {
+        checked = 1;
+        path = getenv("EARTH_ORBIT_SNAPSHOT");
+        if (path) {
+            g_paused = 1;                  /* deterministic frame */
+            const char *keys = getenv("EARTH_ORBIT_SNAPSHOT_KEYS");
+            for (; keys && *keys; keys++) process_key((SDL_Keycode)*keys);
+        }
+    }
+    if (!path || ++frames < 30) return;
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, g_W, g_H, 32,
+                                                    SDL_PIXELFORMAT_ARGB8888);
+    if (s && SDL_RenderReadPixels(g_ren, NULL, SDL_PIXELFORMAT_ARGB8888,
+                                  s->pixels, s->pitch) == 0)
+        SDL_SaveBMP(s, path);
+    if (s) SDL_FreeSurface(s);
+    g_running = 0;
+}
+#endif
+
+/* ======================================================================
    Per-frame callback — called from the while loop (desktop) or from
    emscripten_set_main_loop (WASM).
    ====================================================================== */
@@ -1724,6 +2013,7 @@ static void main_loop(void)
 
     /* ── WASM keyboard poll — drain queue (#3) ─────── */
 #ifdef __EMSCRIPTEN__
+    poll_resize();
     {
         int k;
         while ((k = wasm_poll_key()) >= 0)
@@ -1769,6 +2059,15 @@ static void main_loop(void)
 
     /* ── Events ─────────────────────────────────────── */
     while (SDL_PollEvent(&ev)) {
+        /* SDL reports mouse positions in back-buffer (device) pixels;
+           all hit-testing and drag maths below is in logical space.     */
+        if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) {
+            ev.button.x = (int)(ev.button.x / g_scale);
+            ev.button.y = (int)(ev.button.y / g_scale);
+        } else if (ev.type == SDL_MOUSEMOTION) {
+            ev.motion.x = (int)(ev.motion.x / g_scale);
+            ev.motion.y = (int)(ev.motion.y / g_scale);
+        }
         switch (ev.type) {
         case SDL_QUIT:
             g_running = 0;
@@ -1880,16 +2179,18 @@ static void main_loop(void)
     } else {
         for (int i=0; i<N_STARS; i++) {
             SDL_SetRenderDrawColor(g_ren, star_b[i],star_b[i],star_b[i],255);
-            SDL_RenderDrawPoint(g_ren, star_x[i], star_y[i]);
+            put_px(g_ren, star_x[i], star_y[i]);
         }
 
         double Rpx = BASE_R * g_zoom;
         void *raw; int pitch;
         SDL_LockTexture(g_earth_tex, NULL, &raw, &pitch);
-        memset(raw, 0, (size_t)pitch * WIN_H);
-        render_earth((uint32_t*)raw, pitch/4, Rpx,
+        memset(raw, 0, (size_t)pitch * g_H);
+        render_earth((uint32_t*)raw, pitch/4, g_W, g_H,
+                     CX*g_scale, CY*g_scale, Rpx*g_scale,
                      g_view_yaw, g_view_pitch, g_earth_angle);
         SDL_UnlockTexture(g_earth_tex);
+        /* Texture is g_W×g_H device px; NULL dst = whole window → 1:1. */
         SDL_RenderCopy(g_ren, g_earth_tex, NULL, NULL);
 
         for (int i=0; i<NUM_SATS; i++)
@@ -1933,6 +2234,9 @@ static void main_loop(void)
 
     if (g_recording) video_frame(g_ren);
     SDL_RenderPresent(g_ren);
+#ifndef __EMSCRIPTEN__
+    maybe_snapshot();
+#endif
     g_frame_count++;
 }
 
@@ -1944,32 +2248,42 @@ int main(void) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1;
     }
 
-    /* Create window at the fixed sim resolution.  CSS in shell.html scales
-       the canvas visually; we do NOT use SDL_WINDOW_RESIZABLE because in
-       Emscripten that makes SDL2 track CSS size changes and re-register its
-       event listeners, which breaks keyboard input in the browser.           */
-    SDL_Window *win = SDL_CreateWindow(
+    /* Back-buffer size.  In the browser the page measures the canvas
+       container in device pixels (CSS px × devicePixelRatio) before the
+       runtime starts; on the desktop EARTH_ORBIT_SCALE=1.5 etc. overrides
+       the 1× default (useful for HiDPI displays and large captures).     */
+    int want_w = WIN_W;
+#ifdef __EMSCRIPTEN__
+    want_w = EM_ASM_INT({ return (window._devW | 0) || 1200; });
+    g_last_devw = want_w;
+#else
+    {
+        const char *env = getenv("EARTH_ORBIT_SCALE");
+        double s = env ? atof(env) : 0.0;
+        if (s > 0.0) want_w = (int)lround(WIN_W * s);
+    }
+#endif
+    int W, H;
+    choose_resolution(want_w, &W, &H);
+
+    /* We do NOT use SDL_WINDOW_RESIZABLE: in Emscripten that makes SDL2
+       track CSS size changes itself and re-register its event listeners.
+       Resizing is handled explicitly by poll_resize()/apply_resolution(). */
+    g_win = SDL_CreateWindow(
         "Earth Satellite Orbit Simulation",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H,
+        W, H,
         SDL_WINDOW_SHOWN
     );
-    if (!win) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    if (!g_win) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
-    g_ren = SDL_CreateRenderer(win, -1,
+    g_ren = SDL_CreateRenderer(g_win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!g_ren)   /* no GPU (e.g. SDL_VIDEODRIVER=dummy): software fallback */
+        g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
     if (!g_ren) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
 
-    /* No SDL_RenderSetLogicalSize needed: without SDL_WINDOW_RESIZABLE the
-       SDL renderer stays fixed at WIN_W×WIN_H, so all draw calls and
-       SDL_RenderCopy already share the same coordinate space.  Setting a
-       logical size causes Emscripten to internally resize the canvas element,
-       which resets its event listeners and breaks keyboard input.            */
     SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-
-    g_earth_tex = SDL_CreateTexture(g_ren,
-        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, WIN_W, WIN_H);
-    if (!g_earth_tex) { fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return 1; }
 
     printf("Building land mask..."); fflush(stdout);
     build_land_mask();
@@ -1977,9 +2291,9 @@ int main(void) {
 
     g_map_y_max = log(tan(PI/4.0 + MAP_LAT_CLIP/2.0));
 
-    printf("Building Mercator map texture (Natural Earth 1:50m)..."); fflush(stdout);
-    g_map_tex = build_mercator_texture(g_ren);
-    if (!g_map_tex) { fprintf(stderr, "build_mercator_texture failed\n"); return 1; }
+    printf("Building textures at %dx%d (scale %.3f)...", W, H, (double)W/WIN_W);
+    fflush(stdout);
+    if (!apply_resolution(W, H)) return 1;   /* globe + map textures, font atlas */
     printf(" done\n");
 
     build_stars();
@@ -2002,10 +2316,12 @@ int main(void) {
     }
 
     if (g_recording) video_stop();
+    if (g_font_tex) SDL_DestroyTexture(g_font_tex);
     SDL_DestroyTexture(g_map_tex);
     SDL_DestroyTexture(g_earth_tex);
+    free(map_tex_buf);
     SDL_DestroyRenderer(g_ren);
-    SDL_DestroyWindow(win);
+    SDL_DestroyWindow(g_win);
     SDL_Quit();
 #endif
     return 0;
